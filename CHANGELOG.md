@@ -11,4 +11,4 @@ All notable changes to **`kaggle-shell-mcp`** will be documented in this file.
 - **Detached Background Job Engine (`job_spawn`, `job_list`, `job_logs`, `job_kill`)**: Process-group isolated training jobs with persistent logs in `/kaggle/working/mcp_logs` and automatic `tqdm` carriage-return (`\r`) compaction.
 - **Filtered Tar Streaming (`fs_sync`)**: Fast bidirectional directory/file sync ignoring `.git`, `.venv`, `__pycache__`, and `node_modules`.
 - **Dual Quota & Snapshot Watchdogs**: Graceful `SIGTERM` checkpoint flush at `11h35m` + clean `exit(0)` at `11h40m` (preserving `/kaggle/working` snapshots before Kaggle's 12h reaper) and automatic idle GPU shutdown.
-- **Dual Interface**: Full Model Context Protocol (`stdio`) server (`mcp` v1 & v2 compatible) and standalone `kaggle-shell-mcp` CLI.
+- **Dual Interface**: Full Model Context Protocol (`stdio`) server (`mcp` v1 & v2 compatible) and short `kgsh` CLI (`kaggle-shell-mcp` & `kaggle-mcp` aliases included).

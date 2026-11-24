@@ -185,10 +185,10 @@ def fs_sync(direction: str, local_path: str, remote_path: str = "/kaggle/working
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kaggle-shell-mcp",
-        description="kaggle-shell-mcp — Headless 12h Kaggle Dual-T4 GPU Worker & MCP Server",
+        prog="kgsh",
+        description="kgsh (kaggle-shell-mcp) — Headless 12h Kaggle Dual-T4 GPU Worker & MCP Server",
     )
-    parser.add_argument("--version", action="version", version=f"kaggle-shell-mcp {__version__}")
+    parser.add_argument("--version", action="version", version=f"kgsh {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("mcp", help="Run stdio MCP server explicitly")

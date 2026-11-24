@@ -1,10 +1,10 @@
-# kaggle-shell-mcp ⚡
+# kaggle-shell-mcp (`kgsh`) ⚡
 
 **Turn free 12h Kaggle Dual-T4 GPUs into live, stateful remote terminals & detached job runners for AI Agents via MCP.**
 
 [![CI](https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![MCP Compatible](https://img.shields.io/badge/MCP-stdio-00A67E.svg)](https://modelcontextprotocol.io/)
 
 [**Tiếng Việt (Vietnamese Guide)**](./docs/README.vi.md) · [**Architecture Spec (VN)**](./ARCHITECTURE.md) · [**Contributing**](./CONTRIBUTING.md)
@@ -17,7 +17,7 @@ Kaggle offers ~30 hours/week of free **Dual NVIDIA Tesla T4 GPUs (`2 × 15 GB = 
 - Push static notebooks and wait blindly for completion, or
 - Require manually pasting `ngrok` tokens into a browser cell, installing `openssh-server`, and fixing broken `CUDA`/`LD_LIBRARY_PATH` variables by hand.
 
-**`kaggle-shell-mcp`** bridges the gap in one zero-setup MCP server:
+**`kaggle-shell-mcp`** (CLI command: **`kgsh`**) bridges the gap in one zero-setup MCP server:
 - **Zero Extra Accounts Required**: Needs **only** `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` bearer token or legacy key). No ngrok account, no VPN client required (optional Tailscale userspace mode is also supported).
 - **100% Native CUDA Environment**: Injects a pure-stdlib Python PTY & RPC daemon directly inside the Kaggle Kernel runtime—preserving Conda, PyTorch, `PATH`, and `LD_LIBRARY_PATH` out of the box.
 - **Agent-First Execution Split**:
@@ -35,7 +35,7 @@ Kaggle offers ~30 hours/week of free **Dual NVIDIA Tesla T4 GPUs (`2 × 15 GB = 
 flowchart LR
     subgraph Local["Local Machine (Weak / No GPU)"]
         Agent["AI Agent\n(Claude / Cursor / Antigravity)"]
-        MCP["kaggle-shell-mcp\n(MCP Server & CLI)"]
+        MCP["kgsh\n(MCP Server & CLI)"]
     end
 
     subgraph Kaggle["Kaggle Cloud Container (2x Tesla T4 — Up to 12h)"]
@@ -91,8 +91,8 @@ KAGGLE_KEY=KGAT_your_api_token_here
 ```json
 {
   "mcpServers": {
-    "kaggle-shell-mcp": {
-      "command": "/absolute/path/to/kaggle-shell-mcp/.venv/bin/kaggle-shell-mcp",
+    "kgsh": {
+      "command": "/absolute/path/to/kaggle-shell-mcp/.venv/bin/kgsh",
       "args": [],
       "env": {
         "KAGGLE_USERNAME": "your_kaggle_username",
@@ -102,12 +102,12 @@ KAGGLE_KEY=KGAT_your_api_token_here
   }
 }
 ```
-*(On Windows, point `"command"` to `C:/path/to/kaggle-shell-mcp/.venv/Scripts/kaggle-shell-mcp.exe`. If `.env` is placed in the repo root, the `"env"` block is optional.)*
+*(On Windows, point `"command"` to `C:/path/to/kaggle-shell-mcp/.venv/Scripts/kgsh.exe`. If `.env` is placed in the repo root, the `"env"` block is optional.)*
 
 #### Claude Code CLI
 
 ```bash
-claude mcp add kaggle-shell-mcp -- /absolute/path/to/kaggle-shell-mcp/.venv/bin/kaggle-shell-mcp
+claude mcp add kgsh -- /absolute/path/to/kaggle-shell-mcp/.venv/bin/kgsh
 ```
 
 ---
@@ -128,29 +128,29 @@ claude mcp add kaggle-shell-mcp -- /absolute/path/to/kaggle-shell-mcp/.venv/bin/
 
 ---
 
-## Standalone CLI Usage
+## Standalone CLI Usage (`kgsh`)
 
-`kaggle-shell-mcp` doubles as a direct terminal CLI when invoked with subcommands:
+Invoke `kgsh` with no arguments to run the MCP `stdio` server, or pass subcommands directly from your terminal:
 
 ```bash
 # Check status (costs 0 GPU quota)
-kaggle-shell-mcp status
+kgsh status
 
 # Boot a Dual-T4 GPU session (~50s cold start)
-kaggle-shell-mcp up --idle 30
+kgsh up --idle 30
 
 # Run interactive commands (stateful PTY)
-kaggle-shell-mcp exec "nvidia-smi"
-kaggle-shell-mcp push ./my_project /kaggle/working
+kgsh exec "nvidia-smi"
+kgsh push ./my_project /kaggle/working
 
 # Launch a multi-GPU training job across both T4 GPUs (30 GB total VRAM)
-kaggle-shell-mcp spawn "torchrun --nproc_per_node=2 my_project/train.py" --name lora-run
-kaggle-shell-mcp jobs
-kaggle-shell-mcp logs <job_id> --tail 50
+kgsh spawn "torchrun --nproc_per_node=2 my_project/train.py" --name lora-run
+kgsh jobs
+kgsh logs <job_id> --tail 50
 
 # Pull checkpoints & shut down immediately to save quota
-kaggle-shell-mcp pull /kaggle/working/checkpoints ./checkpoints
-kaggle-shell-mcp down
+kgsh pull /kaggle/working/checkpoints ./checkpoints
+kgsh down
 ```
 
 ---
@@ -158,7 +158,7 @@ kaggle-shell-mcp down
 ## Chaining Runs Longer Than 12 Hours
 
 1. Save periodic checkpoints into `/kaggle/working/checkpoints/` inside your training script (and handle `SIGTERM` if desired for the `11h35m` drain hook).
-2. After Session 1 exits cleanly at `11h40m`, start Session 2 with `chain_previous_output=True` (or `kaggle-shell-mcp up --chain`). Kaggle mounts Session 1's output directly under `/kaggle/input/kaggle-mcp-worker/` at internal datacenter speeds.
+2. After Session 1 exits cleanly at `11h40m`, start Session 2 with `chain_previous_output=True` (or `kgsh up --chain`). Kaggle mounts Session 1's output directly under `/kaggle/input/kaggle-mcp-worker/` at internal datacenter speeds.
 
 ---
 

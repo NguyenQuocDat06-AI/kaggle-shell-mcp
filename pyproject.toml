@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kaggle-shell-mcp"
 version = "0.1.0"
-description = "Turn free 12h Kaggle Dual-T4 GPUs into live remote terminals & background job runners for AI Agents via MCP."
+description = "Turn free 12h Kaggle Dual-T4 GPUs into live remote terminals & detached job runners for AI Agents via MCP."
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
 authors = [
     { name = "Dat Nguyen", email = "nquocdat06.work@gmail.com" },
 ]
@@ -27,12 +28,11 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -58,6 +58,7 @@ Repository = "https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp"
 Issues = "https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/issues"
 
 [project.scripts]
+kgsh = "kaggle_mcp.server:main"
 kaggle-shell-mcp = "kaggle_mcp.server:main"
 kaggle-mcp = "kaggle_mcp.server:main"
 
@@ -71,7 +72,7 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 105
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

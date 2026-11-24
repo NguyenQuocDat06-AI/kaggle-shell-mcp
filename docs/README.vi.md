@@ -1,4 +1,4 @@
-# kaggle-shell-mcp ⚡ (Tài liệu Tiếng Việt)
+# kaggle-shell-mcp (`kgsh`) ⚡ (Tài liệu Tiếng Việt)
 
 **Biến phiên GPU Kaggle 12h miễn phí (Dual NVIDIA T4 × 2 = 30 GB VRAM) thành máy trạm điều khiển trực tiếp qua Terminal & MCP cho AI Agent.**
 
@@ -17,7 +17,7 @@
 
 ---
 
-## Cài đặt nhanh
+## Cài đặt nhanh (Python 3.11+)
 
 ```powershell
 git clone https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp.git
@@ -37,34 +37,34 @@ KAGGLE_KEY=KGAT_token_cua_ban
 ```json
 {
   "mcpServers": {
-    "kaggle-shell-mcp": {
-      "command": "C:/duong/dan/toi/kaggle-shell-mcp/.venv/Scripts/kaggle-shell-mcp.exe",
+    "kgsh": {
+      "command": "C:/duong/dan/toi/kaggle-shell-mcp/.venv/Scripts/kgsh.exe",
       "args": []
     }
   }
 }
 ```
 
-## Sử dụng qua dòng lệnh (CLI)
+## Sử dụng nhanh qua dòng lệnh (`kgsh`)
 
 ```powershell
 # Kiểm tra trạng thái (không tốn quota)
-.\.venv\Scripts\kaggle-shell-mcp.exe status
+kgsh status
 
 # Bật máy Dual T4 (~50 giây)
-.\.venv\Scripts\kaggle-shell-mcp.exe up --idle 30
+kgsh up --idle 30
 
 # Chạy lệnh trực tiếp trên máy Kaggle
-.\.venv\Scripts\kaggle-shell-mcp.exe exec "nvidia-smi"
+kgsh exec "nvidia-smi"
 
 # Đẩy thư mục code từ máy lên /kaggle/working/my_app
-.\.venv\Scripts\kaggle-shell-mcp.exe push .\my_app /kaggle/working
+kgsh push .\my_app /kaggle/working
 
 # Chạy train ngầm trên cả 2 card T4
-.\.venv\Scripts\kaggle-shell-mcp.exe spawn "torchrun --nproc_per_node=2 my_app/train.py" --name run1
-.\.venv\Scripts\kaggle-shell-mcp.exe logs <job_id> --tail 50
+kgsh spawn "torchrun --nproc_per_node=2 my_app/train.py" --name run1
+kgsh logs <job_id> --tail 50
 
 # Kéo kết quả về & tắt máy ngay để tiết kiệm giờ GPU
-.\.venv\Scripts\kaggle-shell-mcp.exe pull /kaggle/working/outputs .\outputs
-.\.venv\Scripts\kaggle-shell-mcp.exe down
+kgsh pull /kaggle/working/outputs .\outputs
+kgsh down
 ```
