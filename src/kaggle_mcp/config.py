@@ -14,7 +14,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-STATE_DIR = PROJECT_ROOT / ".kaggle_mcp"
+
+
+def _default_state_dir() -> Path:
+    custom = (os.environ.get("KAGGLE_MCP_HOME") or "").strip()
+    if custom:
+        return Path(custom).expanduser().resolve()
+    # Keep state in repo root during editable git development; use ~/.kaggle_mcp when installed from PyPI
+    if (PROJECT_ROOT / "pyproject.toml").is_file() and (PROJECT_ROOT / "src" / "kaggle_mcp").is_dir():
+        return PROJECT_ROOT / ".kaggle_mcp"
+    return Path.home() / ".kaggle_mcp"
+
+
+STATE_DIR = _default_state_dir()
 SESSIONS_FILE = STATE_DIR / "sessions.json"
 SESSIONS_LOCK_FILE = STATE_DIR / "sessions.lock"
 ACTIVE_SESSION_FILE = STATE_DIR / "active_session.json"  # Legacy v0.1 path (auto-migrated)
@@ -133,7 +145,7 @@ def _locked_state_store(timeout_sec: float = 10.0):
                         break
                     except OSError:
                         if time.monotonic() >= deadline:
-                            raise TimeoutError("Timed out acquiring .kaggle_mcp/sessions.lock") from None
+                            raise TimeoutError("Timed out acquiring sessions.lock") from None
                         time.sleep(0.02)
             else:
                 import fcntl
@@ -144,7 +156,7 @@ def _locked_state_store(timeout_sec: float = 10.0):
                         break
                     except OSError:
                         if time.monotonic() >= deadline:
-                            raise TimeoutError("Timed out acquiring .kaggle_mcp/sessions.lock") from None
+                            raise TimeoutError("Timed out acquiring sessions.lock") from None
                         time.sleep(0.02)
             yield
         finally:
@@ -180,7 +192,6 @@ def _read_store_unlocked() -> dict[str, ActiveSession]:
         except Exception:
             result = {}
 
-    # Transparent one-time migration from v0.1 active_session.json
     if legacy_path.is_file():
         try:
             legacy_raw = json.loads(legacy_path.read_text(encoding="utf-8"))
@@ -210,15 +221,43 @@ def configure_kaggle_env(username: str, secret: str) -> None:
     os.environ["KAGGLE_USERNAME"] = username
     if secret.startswith("KGAT_"):
         os.environ["KAGGLE_API_TOKEN"] = secret
-        # Prevent KaggleApi from misinterpreting a KGAT_ bearer token as a legacy Basic password
         os.environ.pop("KAGGLE_KEY", None)
     else:
         os.environ["KAGGLE_KEY"] = secret
 
 
+def _read_kaggle_json_fallback() -> tuple[str, str]:
+    """Read standard ~/.kaggle/kaggle.json or ~/.kaggle/access_token if env vars are unset."""
+    kdir = Path(os.environ.get("KAGGLE_CONFIG_DIR") or (Path.home() / ".kaggle")).expanduser()
+    username = ""
+    secret = ""
+
+    kjson = kdir / "kaggle.json"
+    if kjson.is_file():
+        try:
+            data = json.loads(kjson.read_text(encoding="utf-8"))
+            username = str(data.get("username") or "").strip()
+            secret = str(data.get("key") or data.get("token") or "").strip()
+        except Exception:
+            pass
+
+    atok = kdir / "access_token"
+    if not secret and atok.is_file():
+        try:
+            secret = atok.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+
+    return username, secret
+
+
 def load_settings() -> Settings:
-    """Load credentials from .env (project root or cwd) and prepare Kaggle auth env."""
-    env_candidates = [PROJECT_ROOT / ".env", Path.cwd() / ".env"]
+    """Load credentials from env, .env files, or ~/.kaggle/kaggle.json for PyPI/uvx zero-setup."""
+    env_candidates = [
+        Path.cwd() / ".env",
+        STATE_DIR / ".env",
+        PROJECT_ROOT / ".env",
+    ]
     for env_path in env_candidates:
         if env_path.is_file():
             load_dotenv(env_path, override=False)
@@ -231,9 +270,15 @@ def load_settings() -> Settings:
     ).strip()
 
     if not username or not secret:
+        fb_user, fb_secret = _read_kaggle_json_fallback()
+        username = username or fb_user
+        secret = secret or fb_secret
+
+    if not username or not secret:
         raise RuntimeError(
-            "Thiếu KAGGLE_USERNAME hoặc KAGGLE_KEY trong file .env "
-            f"(đã kiểm tra: {PROJECT_ROOT / '.env'})."
+            "Missing Kaggle credentials. Set KAGGLE_USERNAME & KAGGLE_KEY in MCP env, "
+            f"create a .env file ({Path.cwd() / '.env'} or {STATE_DIR / '.env'}), "
+            "or place ~/.kaggle/kaggle.json."
         )
 
     configure_kaggle_env(username, secret)

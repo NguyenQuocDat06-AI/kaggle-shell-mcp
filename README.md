@@ -2,6 +2,7 @@
 
 **Turn free 12h Kaggle GPUs into multi-slot live remote terminals & offline competition runners for AI Agents via MCP.**
 
+[![PyPI](https://img.shields.io/pypi/v/kaggle-shell-mcp.svg)](https://pypi.org/project/kaggle-shell-mcp/)
 [![CI](https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
@@ -17,7 +18,7 @@ Kaggle provides ~30 hours/week of free GPU compute, yet its official API (`kaggl
 
 **`kaggle-shell-mcp`** (CLI: **`kgsh`**) gives AI Agents and developers a unified compute bridge:
 
-- **Zero Extra Accounts Required**: Uses **only** `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` bearer token or legacy key). No `ngrok` account or local VPN client needed (optional Tailscale userspace networking is also supported).
+- **One-Line Zero-Setup**: Install directly from PyPI (`pip install kaggle-shell-mcp` or `uvx`). Uses **only** `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` bearer token, legacy key, or existing `~/.kaggle/kaggle.json`). No `ngrok` account or local VPN client needed.
 - **Dual Concurrent GPU VMs (`4 × Tesla T4 = 60 GB VRAM`)**: Provision up to **2 parallel Kaggle GPU sessions** (`slot="1,2"`) and pin individual jobs via `gpu_ids="0"` / `"1"` to run **4 isolated GPU experiments simultaneously**.
 - **Full Hardware & Hub Support**: Target `NvidiaTeslaT4` (`2×15 GB`), `NvidiaL4`, `NvidiaL4x4` (`96 GB`), `NvidiaRtxPro6000` (`96 GB`), `NvidiaH100`, `TpuV5E8` / `TpuV6E8`, or `cpu`, with native `competition_sources` and zero-copy Kaggle Hub `model_sources` mounts.
 - **Offline Competition Mode + Live Host SSE Logs**: When high-end competition hardware (`L4x4`, `RTX Pro 6000`) forces `enable_internet=False`, `kgsh` bundles Linux wheels (`kaggle_wheelhouse`) + local code (`kaggle_batch_run`) and streams real-time logs via Kaggle's Host SSE feed (`kaggle_batch_logs`) without opening a browser.
@@ -57,43 +58,18 @@ See [**ARCHITECTURE.md**](./ARCHITECTURE.md) for deep-dive internals on slot iso
 
 ---
 
-## Quickstart (60 Seconds)
+## Quickstart (30 Seconds)
 
-### 1. Install (Python 3.11+)
+### Option A: Zero-Install MCP via `uvx` (Recommended for Agents)
 
-```bash
-git clone https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp.git
-cd kaggle-shell-mcp
-python -m venv .venv
-
-# Windows
-.\.venv\Scripts\pip install -e .
-
-# Linux / macOS
-./.venv/bin/pip install -e .
-```
-
-### 2. Configure Credentials
-
-Create `.env` in the project root (or pass environment variables directly in your MCP client config):
-
-```ini
-KAGGLE_USERNAME=your_kaggle_username
-KAGGLE_KEY=KGAT_your_api_token_here
-```
-
-*(Generate your token at [kaggle.com/settings](https://www.kaggle.com/settings) → **API** → **Generate New Token**. Phone verification is required on Kaggle to unlock GPU accelerators.)*
-
-### 3. Connect Your AI Agent (MCP)
-
-#### Claude Desktop / Cursor / Antigravity (`mcp_config.json`)
+Add directly to your **Claude Desktop / Cursor / Windsurf / Antigravity** `mcp_config.json`—no manual virtual environment required:
 
 ```json
 {
   "mcpServers": {
     "kgsh": {
-      "command": "/absolute/path/to/kaggle-shell-mcp/.venv/bin/kgsh",
-      "args": [],
+      "command": "uvx",
+      "args": ["--from", "kaggle-shell-mcp", "kgsh"],
       "env": {
         "KAGGLE_USERNAME": "your_kaggle_username",
         "KAGGLE_KEY": "KGAT_your_api_token_here"
@@ -102,13 +78,26 @@ KAGGLE_KEY=KGAT_your_api_token_here
   }
 }
 ```
-*(On Windows, set `"command"` to `C:/path/to/kaggle-shell-mcp/.venv/Scripts/kgsh.exe`.)*
 
-#### Claude Code CLI
+Or register in **Claude Code CLI** in one line:
+```bash
+claude mcp add kgsh -e KAGGLE_USERNAME=your_user -e KAGGLE_KEY=KGAT_your_token -- uvx --from kaggle-shell-mcp kgsh
+```
+
+### Option B: Install `kgsh` Globally via `pip` / `uv`
 
 ```bash
-claude mcp add kgsh -- /absolute/path/to/kaggle-shell-mcp/.venv/bin/kgsh
+pip install kaggle-shell-mcp
+# or isolated CLI install:
+uv tool install kaggle-shell-mcp
 ```
+
+Credentials are discovered automatically from any of:
+1. `KAGGLE_USERNAME` + `KAGGLE_KEY` environment variables,
+2. `.env` in your current working directory or `~/.kaggle_mcp/.env`, or
+3. Your existing `~/.kaggle/kaggle.json` file.
+
+*(Generate an API token at [kaggle.com/settings](https://www.kaggle.com/settings) → **API** → **Generate New Token**. Phone verification is required on Kaggle to unlock GPU accelerators.)*
 
 ---
 

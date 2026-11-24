@@ -27,7 +27,19 @@ pytest -v
 
 ## Design Principles
 
-1. **Zero-Setup First**: Everything must work out of the box with only `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` or legacy hex key). Optional transports (such as Tailscale) must remain strictly opt-in.
+1. **Zero-Setup First**: Everything must work out of the box with only `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...`, legacy hex key, or `~/.kaggle/kaggle.json`). Optional transports (such as Tailscale) must remain strictly opt-in.
 2. **Stdlib-Only Remote Worker**: `src/kaggle_mcp/remote/worker_template.py` runs directly inside the Kaggle Python image without requiring `apt-get` or extra system packages, preserving 100% of pre-configured CUDA/Conda environment variables.
 3. **Stdio Purity**: Never write diagnostic text to `sys.stdout` inside library modules—MCP `stdio` uses `stdout` exclusively for JSON-RPC frames.
-4. **Quota Respect**: Any changes to worker lifecycle logic must preserve both the `11h40m` graceful drain (`exit 0`) and the idle GPU auto-shutdown watchdog.
+4. **Safe Drain & Multi-Slot Isolation**: Any changes to worker lifecycle or local state storage must preserve the `11h40m` (`8h40m` TPU) graceful drain (`exit 0`) and OS file locking on `sessions.json`.
+
+## Releasing to PyPI (Maintainers)
+
+Publishing is automated via [`.github/workflows/publish.yml`](./.github/workflows/publish.yml) using PyPI **Trusted Publishing** (OIDC—no long-lived PyPI API tokens stored in GitHub Secrets):
+
+1. Configure a Trusted Publisher once at `https://pypi.org/manage/account/publishing/`:
+   - **PyPI Project Name**: `kaggle-shell-mcp`
+   - **Owner**: `NguyenQuocDat06-AI`
+   - **Repository name**: `kaggle-shell-mcp`
+   - **Workflow name**: `publish.yml`
+2. Bump the version in `pyproject.toml`, `src/kaggle_mcp/__init__.py`, and `CHANGELOG.md`.
+3. Create a GitHub Release (`gh release create vX.Y.Z --generate-notes`) or trigger `gh workflow run publish.yml`.

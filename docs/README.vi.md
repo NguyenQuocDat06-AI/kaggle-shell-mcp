@@ -6,7 +6,7 @@
 
 ## Điểm nổi bật của `kaggle-shell-mcp` (v0.2)
 
-1. **Không cần VPN hay tài khoản trung gian**: Chỉ cần `KAGGLE_USERNAME` và `KAGGLE_KEY` (`KGAT_...` hoặc key hex cũ) trong `.env`. Tự động mở đường truyền Cloudflare Quick Tunnel và trao đổi địa chỉ qua Private Dataset riêng cho từng slot.
+1. **Cài đặt 1 dòng qua PyPI / `uvx` — Không cần VPN hay tài khoản trung gian**: Chỉ cần `KAGGLE_USERNAME` và `KAGGLE_KEY` (`KGAT_...`, key hex cũ, hoặc tự nhận sẵn `~/.kaggle/kaggle.json`). Tự động mở đường truyền Cloudflare Quick Tunnel và trao đổi địa chỉ qua Private Dataset riêng cho từng slot.
 2. **Chạy song song 2 máy GPU cùng lúc (`4 × Tesla T4 = 60 GB VRAM`)**:
    - Hỗ trợ đa `slot` (`kgsh up -s 1,2`) khởi chạy đồng thời 2 máy ảo GPU độc lập không đụng độ trạng thái.
    - Hỗ trợ ghim card lẻ (`gpu_ids="0"` hoặc `"1"`) trong `job_spawn` để chạy **4 thí nghiệm GPU độc lập cùng lúc** trên 2 máy.
@@ -21,33 +21,44 @@
 
 ---
 
-## Cài đặt nhanh (Python 3.11+)
+## Cài đặt & Kết nối MCP (30 giây)
 
-```powershell
-git clone https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp.git
-cd kaggle-shell-mcp
-python -m venv .venv
-.\.venv\Scripts\pip install -e .
-```
+### Cách 1: Chạy trực tiếp qua `uvx` (Không cần tự tạo `.venv`)
 
-Tạo file `.env`:
-```ini
-KAGGLE_USERNAME=ten_tai_khoan_kaggle
-KAGGLE_KEY=KGAT_token_cua_ban
-```
-
-## Cấu hình MCP (`mcp_config.json`)
+Dán thẳng vào `mcp_config.json` của **Claude Desktop / Cursor / Windsurf / Antigravity**:
 
 ```json
 {
   "mcpServers": {
     "kgsh": {
-      "command": "C:/duong/dan/toi/kaggle-shell-mcp/.venv/Scripts/kgsh.exe",
-      "args": []
+      "command": "uvx",
+      "args": ["--from", "kaggle-shell-mcp", "kgsh"],
+      "env": {
+        "KAGGLE_USERNAME": "ten_tai_khoan_kaggle",
+        "KAGGLE_KEY": "KGAT_token_cua_ban"
+      }
     }
   }
 }
 ```
+
+Hoặc gắn vào **Claude Code CLI** bằng 1 lệnh:
+```bash
+claude mcp add kgsh -e KAGGLE_USERNAME=ten_ban -e KAGGLE_KEY=KGAT_token -- uvx --from kaggle-shell-mcp kgsh
+```
+
+### Cách 2: Cài lệnh `kgsh` toàn cục qua `pip` / `uv`
+
+```powershell
+pip install kaggle-shell-mcp
+# hoặc cài độc lập qua uv:
+uv tool install kaggle-shell-mcp
+```
+
+Công cụ tự động đọc thông tin xác thực theo thứ tự:
+1. Biến môi trường `KAGGLE_USERNAME` + `KAGGLE_KEY`,
+2. File `.env` ở thư mục hiện tại hoặc `~/.kaggle_mcp/.env`,
+3. File chuẩn `~/.kaggle/kaggle.json` nếu máy đã đăng nhập Kaggle trước đó.
 
 ---
 

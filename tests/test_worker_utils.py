@@ -9,7 +9,12 @@ import os
 import re
 from pathlib import Path
 
-from kaggle_mcp.config import DEFAULT_IDLE_TIMEOUT_MIN, Settings, configure_kaggle_env
+from kaggle_mcp.config import (
+    DEFAULT_IDLE_TIMEOUT_MIN,
+    Settings,
+    _read_kaggle_json_fallback,
+    configure_kaggle_env,
+)
 from kaggle_mcp.launcher import build_bootstrap_bundle
 
 
@@ -88,3 +93,14 @@ def test_clean_tqdm_collapses_carriage_returns() -> None:
     clean_tqdm = ns["clean_tqdm"]
     noisy = "Epoch 1\r\n10%|#   |\r50%|##### |\r100%|##########| 10/10 [00:02]\r\nloss=0.12"
     assert clean_tqdm(noisy) == "Epoch 1\n100%|##########| 10/10 [00:02]\nloss=0.12"
+
+
+def test_kaggle_json_fallback_for_pypi_installs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("KAGGLE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "kaggle.json").write_text(
+        json.dumps({"username": "pypi_user", "key": "KGAT_from_json"}),
+        encoding="utf-8",
+    )
+    user, secret = _read_kaggle_json_fallback()
+    assert user == "pypi_user"
+    assert secret == "KGAT_from_json"
