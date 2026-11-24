@@ -46,14 +46,15 @@ def _fmt(data: Any) -> str:
 @mcp.tool()
 def kaggle_up(
     gpu: bool = True,
-    idle_timeout_min: int = 30,
+    idle_timeout_min: int = 0,
     mount_datasets: list[str] | None = None,
     chain_previous_output: bool = False,
     wait_ready_sec: int = 240,
 ) -> str:
-    """Provision a headless Kaggle GPU worker (up to 11h40m safe drain, auto-shutdown after `idle_timeout_min`).
+    """Provision a headless Kaggle GPU worker (stays alive up to 11h40m safe drain).
 
     - `gpu=True`: requests Dual NVIDIA T4 x2 (`NvidiaTeslaT4`, 2x15GB VRAM).
+    - `idle_timeout_min=0`: optional idle auto-shutdown in minutes (`0` = disabled by default; set e.g. `30` to auto-stop when idle).
     - `mount_datasets`: list of Kaggle dataset slugs (`["owner/dataset-slug"]`) mounted at `/kaggle/input`.
     - `chain_previous_output=True`: mounts previous `/kaggle/working` output to continue >12h training runs.
     """
@@ -195,7 +196,12 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
     p_up = sub.add_parser("up", help="Boot headless Kaggle GPU worker")
     p_up.add_argument("--no-gpu", action="store_true", help="Boot CPU-only instance")
-    p_up.add_argument("--idle", type=int, default=30, help="Idle auto-shutdown minutes (default: 30)")
+    p_up.add_argument(
+        "--idle",
+        type=int,
+        default=0,
+        help="Optional idle auto-shutdown minutes (0 = disabled by default)",
+    )
     p_up.add_argument("--wait", type=int, default=240, help="Max seconds to wait for tunnel readiness")
     p_up.add_argument("--dataset", action="append", default=[], help="Mount Kaggle dataset owner/slug")
     p_up.add_argument("--chain", action="store_true", help="Mount previous kernel output")

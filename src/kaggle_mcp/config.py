@@ -15,7 +15,7 @@ ACTIVE_SESSION_FILE = STATE_DIR / "active_session.json"
 
 MAX_LIFETIME_SEC = 42000  # 11h 40m safe exit before Kaggle 12h hard reaper
 DRAIN_AT_SEC = 41700      # 11h 35m SIGTERM checkpoint window
-DEFAULT_IDLE_TIMEOUT_MIN = 30
+DEFAULT_IDLE_TIMEOUT_MIN = 0  # 0 = disabled by default (opt-in via idle_timeout_min / --idle)
 DEFAULT_KERNEL_SLUG = "kaggle-mcp-worker"
 DEFAULT_STATE_DATASET_SLUG = "kaggle-mcp-state"
 

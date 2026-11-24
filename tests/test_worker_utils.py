@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import os
 import re
 from pathlib import Path
 
-from kaggle_mcp.config import Settings, configure_kaggle_env
+from kaggle_mcp.config import DEFAULT_IDLE_TIMEOUT_MIN, Settings, configure_kaggle_env
 from kaggle_mcp.launcher import build_bootstrap_bundle
 
 
@@ -35,7 +36,7 @@ def test_bootstrap_bundle_renders_valid_python_and_metadata(tmp_path: Path, monk
         session_id="sess123",
         worker_token="tok456",
         gpu=True,
-        idle_timeout_min=25,
+        idle_timeout_min=DEFAULT_IDLE_TIMEOUT_MIN,
         mount_datasets=["tester/my-data"],
         chain_previous_output=True,
     )
@@ -43,6 +44,10 @@ def test_bootstrap_bundle_renders_valid_python_and_metadata(tmp_path: Path, monk
     worker_src = (bundle / "bootstrap_worker.py").read_text(encoding="utf-8")
     assert "__BOOTSTRAP_CONFIG_B64__" not in worker_src
     compile(worker_src, "bootstrap_worker.py", "exec")
+    m = re.search(r'BOOTSTRAP_CONFIG_B64 = "([^"]+)"', worker_src)
+    assert m is not None
+    decoded_cfg = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
+    assert decoded_cfg["idle_timeout_sec"] == 0
 
     meta = json.loads((bundle / "kernel-metadata.json").read_text(encoding="utf-8"))
     assert meta["id"] == "tester/kaggle-mcp-worker"

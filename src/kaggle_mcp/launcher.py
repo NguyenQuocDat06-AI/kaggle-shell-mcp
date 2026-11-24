@@ -185,7 +185,7 @@ def build_bootstrap_bundle(
 def launch_worker(
     settings: Settings,
     gpu: bool = True,
-    idle_timeout_min: int = 30,
+    idle_timeout_min: int = 0,
     mount_datasets: list[str] | None = None,
     chain_previous_output: bool = False,
     wait_ready_sec: int = 240,
