@@ -1,6 +1,22 @@
 # Changelog
 
-All notable changes to **`kaggle-shell-mcp`** will be documented in this file.
+All notable changes to **`kaggle-shell-mcp`** (`kgsh`) will be documented in this file.
+
+## [0.2.0] - 2026-11-25
+
+### Added
+- **Multi-Slot Concurrent GPU Architecture (`slot="1"`, `"2"`, `"1,2"`)**:
+  - Run up to 2 parallel headless Kaggle GPU sessions simultaneously (`4 × Tesla T4 = 60 GB VRAM`) with isolated kernel slugs, isolated handshake datasets, and a cross-process file-locked `.kaggle_mcp/sessions.json` store (auto-migrating legacy `active_session.json`).
+  - Added per-job GPU pinning (`gpu_ids` / `--gpus`) in `job_spawn` via isolated `CUDA_VISIBLE_DEVICES`, enabling up to 4 concurrent single-GPU experiments across 2 Dual-T4 VMs.
+  - Added `slot="all"` support in `kaggle_status` and `kaggle_down`, plus automatic stale-session cleanup when Kaggle reports terminal kernel states (`COMPLETE`, `ERROR`, `CANCEL_ACKNOWLEDGED`).
+- **Full Hardware Accelerator, Competition & Model Hub Support (`accelerators.py`)**:
+  - Added `accelerator` aliases and passthrough shapes (`NvidiaTeslaT4`, `NvidiaL4`, `NvidiaL4x4`, `NvidiaRtxPro6000`, `NvidiaH100`, `TpuV5E8`, `TpuV6E8`, `cpu`).
+  - Automatic TPU runtime window adjustment (`8h35m` `SIGTERM` drain / `8h40m` clean exit before Kaggle's 9h TPU cap).
+  - Added `competition` (`competition_sources`) and `mount_models` (`model_sources`) parameters with immediate source-validation error reporting from `ApiSaveKernelResponse`.
+- **Offline Competition Runner & Live Host SSE Logs (`batch.py`)**:
+  - `kaggle_wheelhouse` (`kgsh wheels`): Builds Linux `manylinux_x86_64` binary wheel datasets for air-gapped kernels.
+  - `kaggle_batch_run` (`kgsh batch-run`): Runs competition jobs with `enable_internet=False` using atomic inline code embedding (`<= 512 KB`) or `.kgsh` dataset archives (`> 512 KB`, preventing Kaggle auto-decompression races).
+  - `kaggle_batch_logs` (`kgsh batch-logs`): Non-blocking windowed Host SSE log reader (`kernels_logs_stream`) that streams live logs even when container internet access is disabled.
 
 ## [0.1.0] - 2026-11-24
 

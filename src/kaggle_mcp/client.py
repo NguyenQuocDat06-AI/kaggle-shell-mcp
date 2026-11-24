@@ -1,4 +1,4 @@
-"""Authenticated HTTP client to the remote Kaggle worker with auto-healing tunnel lookup."""
+"""Authenticated HTTP client to a slotted remote Kaggle worker with auto-healing tunnel lookup."""
 
 from __future__ import annotations
 
@@ -7,19 +7,27 @@ from typing import Any
 
 import httpx
 
-from .config import ActiveSession, Settings, load_active_session, save_active_session
+from .config import ActiveSession, Settings, load_active_session, normalize_slot, save_active_session
 from .launcher import fetch_remote_state, get_kaggle_api, probe_worker_ping
 from .sync import pack_tar_gz, unpack_tar_gz
 
 
 class WorkerClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, slot: str = "1") -> None:
         self.settings = settings
+        self.slot = normalize_slot(slot)
 
     def _get_ready_session(self, allow_refresh: bool = True) -> ActiveSession:
-        sess = load_active_session()
+        sess = load_active_session(self.slot)
         if not sess:
-            raise RuntimeError("Chưa có phiên Kaggle nào đang mở. Hãy gọi tool `kaggle_up` trước.")
+            raise RuntimeError(
+                f"Chưa có phiên Kaggle nào ở slot '{self.slot}'. Hãy gọi `kaggle_up(slot='{self.slot}')` trước."
+            )
+        if sess.mode == "batch":
+            raise RuntimeError(
+                f"Slot '{self.slot}' ({sess.kernel_ref}) là phiên chạy batch offline (không có live tunnel). "
+                "Hãy dùng `kaggle_batch_logs` hoặc `kaggle_status` để theo dõi."
+            )
 
         if sess.base_url and probe_worker_ping(sess.base_url, sess.session_id):
             return sess
@@ -30,13 +38,13 @@ class WorkerClient:
                 return refreshed
 
         raise RuntimeError(
-            f"Không kết nối được tới worker (session={sess.session_id}). "
-            "Kiểm tra bằng `kaggle_status` hoặc gọi `kaggle_up` để mở phiên mới."
+            f"Không kết nối được tới worker ở slot '{self.slot}' (session={sess.session_id}). "
+            f"Kiểm tra bằng `kaggle_status(slot='{self.slot}')` hoặc gọi `kaggle_up(slot='{self.slot}')`."
         )
 
     def _refresh_endpoint(self, sess: ActiveSession) -> ActiveSession | None:
         api = get_kaggle_api(self.settings)
-        rstate = fetch_remote_state(api, self.settings)
+        rstate = fetch_remote_state(api, self.settings, slot=self.slot)
         if not rstate or rstate.get("session_id") != sess.session_id:
             return None
         if rstate.get("status") == "stopped":
@@ -48,7 +56,7 @@ class WorkerClient:
             if probe_worker_ping(url, sess.session_id):
                 sess.tunnel_url = tunnel_url
                 sess.ts_url = ts_url if url == ts_url else ""
-                save_active_session(sess)
+                save_active_session(sess, slot=self.slot)
                 return sess
         return None
 
@@ -84,7 +92,7 @@ class WorkerClient:
                         sess = refreshed
                         continue
                 if resp.status_code >= 400:
-                    raise RuntimeError(f"Worker HTTP {resp.status_code}: {resp.text[:500]}")
+                    raise RuntimeError(f"Worker [slot={self.slot}] HTTP {resp.status_code}: {resp.text[:500]}")
                 return resp
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
                 if attempt == 0:
@@ -92,7 +100,7 @@ class WorkerClient:
                     if refreshed:
                         sess = refreshed
                         continue
-                raise RuntimeError(f"Lỗi kết nối tới Kaggle worker ({url}): {exc}") from exc
+                raise RuntimeError(f"Lỗi kết nối tới Kaggle worker [slot={self.slot}] ({url}): {exc}") from exc
 
         raise RuntimeError("Request failed after endpoint refresh.")
 
@@ -111,11 +119,17 @@ class WorkerClient:
             timeout=http_timeout,
         ).json()
 
-    def job_spawn(self, command: str, cwd: str = "/kaggle/working", name: str = "") -> dict[str, Any]:
+    def job_spawn(
+        self,
+        command: str,
+        cwd: str = "/kaggle/working",
+        name: str = "",
+        gpu_ids: str = "",
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/jobs/spawn",
-            json_body={"command": command, "cwd": cwd, "name": name},
+            json_body={"command": command, "cwd": cwd, "name": name, "gpu_ids": gpu_ids},
             timeout=30.0,
         ).json()
 
@@ -152,6 +166,7 @@ class WorkerClient:
             timeout=300.0,
         )
         res = resp.json()
+        res["slot"] = self.slot
         res["uploaded_kb"] = round(len(tar_bytes) / 1024, 1)
         return res
 
@@ -166,6 +181,7 @@ class WorkerClient:
         extracted = unpack_tar_gz(resp.content, dest)
         return {
             "ok": True,
+            "slot": self.slot,
             "remote_path": remote_path,
             "local_dest": str(dest.expanduser().resolve()),
             "downloaded_kb": round(len(resp.content) / 1024, 1),

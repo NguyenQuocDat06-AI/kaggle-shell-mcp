@@ -1,225 +1,136 @@
-# Thiết kế Kiến trúc `kaggle_mcp`: Headless 12h GPU Worker & Remote Terminal cho AI Agent
+# Architecture of `kaggle-shell-mcp` (`kgsh`)
 
-Tài liệu khảo sát mã nguồn mở hiện có, phân tích ràng buộc hạ tầng container của Kaggle và đặc tả kiến trúc chi tiết cho `kaggle_mcp` — công cụ biến phiên batch 12h của Kaggle thành node GPU điều khiển trực tiếp qua MCP cho Agent.
+This document describes the container constraints of Kaggle Kernels, the dual-mode execution architecture of `kaggle-shell-mcp`, and the internal mechanisms that enable multi-slot live terminals and air-gapped competition execution over the Model Context Protocol (MCP).
 
 ---
 
-## 1. Bối cảnh kỹ thuật & Ràng buộc hạ tầng Kaggle
+## 1. Platform Constraints & Design Drivers
 
-Kaggle API chính thức (`kaggle kernels push`) được thiết kế theo mô hình **fire-and-forget batch execution** (đẩy notebook/script lên, chạy từ đầu đến cuối, xuất kết quả ra `/kaggle/working`), không hỗ trợ phiên tương tác trực tiếp. Khi thiết kế công cụ giữ máy chạy ngầm 12h và mở terminal cho Agent, hệ thống phải tuân thủ các ràng buộc vật lý sau của container Kaggle:
+Kaggle's official `kernels_push` API executes non-interactive batch runs inside ephemeral, unprivileged Linux containers. Turning these containers into reliable, interactive GPU compute nodes for AI Agents requires designing around six hard platform constraints:
 
-| Thông số / Ràng buộc | Giá trị thực tế trên Kaggle | Hệ quả thiết kế |
+| Platform Constraint | Runtime Reality | Architectural Design in `kgsh` |
 | :--- | :--- | :--- |
-| **Cấu hình GPU Free** | `NvidiaTeslaT4` (**Dual T4 x2**, 2 × 15 GB VRAM; P100 đã ngừng cấp) | Phải khai báo tường minh `"machine_shape": "NvidiaTeslaT4"` trong `kernel-metadata.json` |
-| **Quota GPU hàng tuần** | ~30 giờ / tuần (trừ theo tỷ lệ 1:1 thời gian thực, kể cả T4 x2) | Bắt buộc có **Idle Watchdog** tự tắt phiên khi Agent ngắt kết nối và không có tiến trình train đang chạy |
-| **Trần thời gian chạy (Hard Cap)** | **12 giờ** đối với CPU/GPU commit (`kernels push`); 9 giờ với TPU | Nếu để bị hệ thống kill cứng ở `12h00m`, commit rơi vào trạng thái lỗi và mất snapshot `/kaggle/working`. Worker phải tự **graceful exit (`exit 0`) ở ~`11h40m`** |
-| **Idle Timeout** | Interactive browser bị ngắt sau ~20 phút rỗi; **Batch commit (`kernels push`) không cần mở trình duyệt** | Bắt buộc khởi chạy qua `kaggle kernels push` (chế độ `script` hoặc `notebook` ngầm) thay vì mở UI |
-| **Dung lượng ổ đĩa** | `/kaggle/working`: tối đa **~19.5–20 GB** (lưu lại sau khi commit `exit 0`); `/tmp`: ổ tạm dung lượng lớn hơn nhưng mất sạch khi tắt container | Dataset thô tải vào `/tmp`; chỉ lưu checkpoint / log / model weights vào `/kaggle/working` |
-| **Mạng & Quyền Container** | Chặn toàn bộ inbound port; không có thiết bị `/dev/net/tun` (`CAP_NET_ADMIN` bị khóa) | Phải dùng kết nối **outbound**; nếu chạy Tailscale bắt buộc bật cờ `--tun=userspace-networking` (`netstack`) |
-| **Biến môi trường CUDA** | `PATH`, `LD_LIBRARY_PATH`, Conda env chỉ nạp sẵn trong tiến trình kernel | Nếu cài `openssh-server` (`sshd`), shell con bị mất biến môi trường CUDA; chạy Python daemon trực tiếp trong tiến trình script giữ nguyên 100% env |
+| **Inbound Firewall & Missing TUN** | All inbound ports are blocked; `/dev/net/tun` (`CAP_NET_ADMIN`) is unavailable | Outbound reverse tunnels (`cloudflared` Quick Tunnel by default; optional `tailscaled --tun=userspace-networking`) |
+| **Hard Execution Ceilings** | **12 hours** for GPU/CPU commits; **9 hours** for TPU commits. Hard-killed runs lose `/kaggle/working` snapshots | In-container watchdog sends `SIGTERM` at `11h35m` (`8h35m` on TPU) and calls `sys.exit(0)` at `11h40m` (`8h40m` on TPU) |
+| **Persistent vs. Ephemeral Disk** | `/kaggle/working` persists up to **~19.5 GB** on clean `exit(0)`; `/tmp` has larger scratch space but wipes on exit | Keep transient bundles/wheels in `/tmp`; reserve `/kaggle/working` strictly for logs, checkpoints, and final outputs |
+| **CUDA Environment Inheritance** | `PATH`, `LD_LIBRARY_PATH`, and Conda paths are initialized on the kernel Python process, not system-wide `sshd` | Run a zero-dependency Python stdlib RPC + PTY daemon directly inside the kernel Python process (no `apt` / `openssh-server`) |
+| **Concurrent GPU Session Limit** | Up to **2 concurrent GPU commit sessions** per Kaggle account, but a single kernel slug cannot track two live runs cleanly | Zero-contention **Slot Isolation** (`slot="1"`, `"2"`, ...) with dedicated kernel slugs, dedicated state datasets, and OS file locking |
+| **Air-Gapped Competition GPUs** | High-tier competition shapes (`NvidiaL4x4`, `NvidiaRtxPro6000`) often enforce `enable_internet: false` | **Dual-Mode Engine**: falls back to offline wheelhouse + atomic code bundling and streams live logs via Kaggle's **Host SSE** endpoint |
 
 ---
 
-## 2. Khảo sát các mã nguồn mở đã có trên GitHub
+## 2. System Architecture
 
-Hiện tại **chưa có dự án mã nguồn mở đơn lẻ nào** giải quyết trọn vẹn cả 3 khâu: *(1) Tự động boot phiên 12h qua API không cần trình duyệt + (2) Mở kênh điều khiển terminal/tiến trình thời gian thực + (3) Đóng gói thành MCP Server có cơ chế bảo vệ quota & tự chốt phiên*. Cộng đồng hiện chia thành 3 mảnh rời:
-
-### 2.1. Nhóm Kaggle MCP & Batch GPU Runners (Thiếu Live Terminal)
-Các công cụ này giúp Agent gọi Kaggle API nhưng vẫn chạy theo luồng *viết toàn bộ script → đẩy lên → chờ chạy xong → tải log*:
-* **Official Kaggle MCP (`https://www.kaggle.com/mcp`)**: Hàng chính chủ Kaggle, hỗ trợ tra cứu dataset/competition/notebook và quản lý phiên cơ bản qua HTTP/OAuth, không cung cấp shell tương tác.
-* **[`MOON-DREAM-STARS/Link2Colab-Kaggle`](https://github.com/MOON-DREAM-STARS/Link2Colab-Kaggle)**: CLI (`l2kc`) + MCP server hợp nhất cho Kaggle và Colab. Có SQLite quản lý trạng thái job và kiểm tra quota, nhưng chỉ đẩy job batch, không thể gõ lệnh tương tác hay sửa lỗi nóng giữa chừng.
-* **`shanmukhdatta/kaggle-gpu-mcp`**, **`54yyyu/kaggle-mcp`**, **`Dishant27/kaggle-MCP`**: Bọc CLI `kaggle kernels push/status/output` thành MCP tools. Nếu code lỗi ở phút thứ 3, Agent phải sửa code local rồi push lại bản build mới từ đầu (mất 2–4 phút cấp phát lại container).
-
-### 2.2. Nhóm SSH / Tunnel vào Kaggle (Thiếu tự động hóa API & MCP)
-Các repo này tập trung phục vụ người dùng nối VS Code Remote-SSH thủ công:
-* **[`hoang-quoc-trung/remote-ssh-kaggle-vscode`](https://github.com/hoang-quoc-trung/remote-ssh-kaggle-vscode)**, **[`lamhoangtung/remokaggle`](https://github.com/lamhoangtung/remokaggle)**, **`slooi/kaggle-ssh`**: Cài `apt-get install openssh-server` + mở TCP tunnel qua `ngrok`. Nhược điểm: mỗi lần chạy đổi port ngẫu nhiên, phải copy-paste địa chỉ thủ công, cài `apt` tốn thời gian boot, và phải vá lại `/etc/environment` để nhận `nvidia-smi`.
-* **[`int11/Kaggle_remote_zrok`](https://github.com/int11/Kaggle_remote_zrok)**: Dùng `zrok` (OpenZiti overlay) thay `ngrok` để ổn định băng thông hơn, nhưng vẫn hướng tới thao tác tay cho VS Code.
-* **[`Alireza99Salehi/VSCodeTunnel`](https://github.com/Alireza99Salehi/VSCodeTunnel)**: Dùng `code tunnel` của Microsoft. Vướng bước xác thực mã thiết bị (device login) trên trình duyệt nên không chạy tự động 100% cho Agent được.
-* **`kumaresankp/kaggle_32gpu_free`**: Dùng `cloudflared` Quick Tunnel (`*.trycloudflare.com`) để phơi cổng HTTP (như Ollama) ra ngoài.
-
-### 2.3. Nhóm SSH / Remote Shell MCP cho Agent (Không gắn với vòng đời Kaggle)
-* **`chouzz/remoteShell-mcp`**, **`WilliamSmithEdward/pySSHForAgents`**, **`zw-awa/ssh-session-mcp`**: Cấp quyền cho Agent chạy lệnh SSH hoặc giữ PTY có trạng thái trên máy chủ Linux sẵn có.
-* **`dhjz/agent-remote-shell`**: Single-binary mở HTTP API nhẹ cho Agent chạy lệnh shell và đồng bộ file thay vì dùng giao thức SSH nặng nề.
-
-### Bảng tổng hợp so sánh
-
-| Giải pháp | Boot ngầm qua API (12h) | Live Terminal / PTY | Giữ env CUDA gốc | Bảo vệ 30h Quota & Auto-Exit | Giao diện MCP cho Agent |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `Link2Colab-Kaggle` / `kaggle-gpu-mcp` | Có | Không | Có | Một phần | Có |
-| `remote-ssh-kaggle-vscode` (`ngrok`+`sshd`) | Không (mở tay) | Có | Phải vá tay | Không | Không |
-| `pySSHForAgents` / `ssh-session-mcp` | Không | Có | Tùy host | Không | Có |
-| **Kiến trúc `kaggle_mcp` (Đề xuất)** | **Có** | **Có (PTY + Async Job)** | **Có (100%)** | **Có (11h40m drain + Idle timer)** | **Có** |
-
----
-
-## 3. Kiến trúc đề xuất cho `kaggle_mcp`
-
-Thay vì cài `openssh-server` nặng nề và dễ lỗi biến môi trường, giải pháp gọn và bền nhất là nhúng một **Python Agent Daemon** (HTTP/WebSocket + PTY/Subprocess manager) chạy trực tiếp bên trong tiến trình Python của Kaggle Kernel, nối về máy local qua **Tailscale Userspace Networking** (hoặc `cloudflared` / `zrok` làm phương án dự phòng).
-
-### 3.1. Sơ đồ tổng thể
+`kaggle-shell-mcp` combines **Mode 1 (Interactive Live Worker)** for rapid R&D/debugging and **Mode 2 (Offline Competition Runner)** for air-gapped hardware inside a single MCP server and CLI.
 
 ```mermaid
-flowchart LR
-    subgraph Local["Máy Local (GPU yếu)"]
-        Agent["AI Agent\n(Claude / Cursor / AGY)"]
-        MCP["kaggle_mcp Server\n(FastMCP / stdio)"]
-        TS_Local["Tailscale Client\n(100.x.y.1)"]
-        K_CLI["Kaggle API Client"]
+flowchart TB
+    subgraph Client["Local Host"]
+        Agent["MCP Client (Claude / Cursor / Antigravity) or CLI (kgsh)"]
+        Server["server.py — 12 MCP Tools & CLI Router\n(stdout-protected JSON-RPC)"]
+        Store[".kaggle_mcp/sessions.json\n(RLock + OS File Lock: msvcrt / fcntl)"]
     end
 
-    subgraph Kaggle["Kaggle Cloud Container (Dual T4 x2 - Tối đa 12h)"]
-        Bootstrap["bootstrap_worker.py\n(Chạy qua kernels push)"]
-        TS_Remote["tailscaled\n(--tun=userspace-networking)\nkaggle-gpu-worker:8765"]
-        Daemon["Worker RPC & PTY Daemon\n(FastAPI / asyncio)"]
-        PTY["Interactive Shell Sessions\n(bash PTY giữ cwd/env)"]
-        BG["Detached GPU Jobs\n(torchrun / train.py)"]
-        Watchdog["Lifecycle Watchdog\n(11h40m Hard Drain + 30m Idle)"]
+    subgraph Mode1["Mode 1: Interactive Live Worker (Internet ON — Up to 2 Parallel GPU VMs)"]
+        Boot["bootstrap_worker.py (stdlib ThreadingHTTPServer)"]
+        Sup["Tunnel Supervisor\nCloudflared / Tailscale netstack"]
+        StateDS["Private Handshake Dataset\n<user>/kaggle-mcp-state[-<slot>]"]
+        PTY["PtyManager (/bin/bash)\nSplit-Quote Sentinel Framing"]
+        Jobs["JobManager (setsid)\nCUDA_VISIBLE_DEVICES Pinning"]
+        Dog["Lifecycle Watchdog\n11h40m Safe Drain + Optional Idle Guard"]
     end
 
-    Agent <-->|"MCP Tools"| MCP
-    MCP -->|"1. Push bootstrap & check status"| K_CLI
-    K_CLI -->|"kaggle kernels push"| Bootstrap
-    Bootstrap -->|"2. Khởi chạy"| TS_Remote
-    Bootstrap -->|"3. Khởi chạy"| Daemon
-    Bootstrap -->|"4. Giám sát"| Watchdog
-    MCP <-->|"5. HTTP/WS qua Tailnet\n(Bearer Token)"| TS_Local
-    TS_Local <-->|"WireGuard P2P / DERP"| TS_Remote
-    TS_Remote <--> Daemon
-    Daemon --> PTY
-    Daemon --> BG
-    Watchdog -->|"Chốt checkpoint & exit(0)"| Bootstrap
+    subgraph Mode2["Mode 2: Offline Competition Runner (Internet OFF — L4x4 / RTX Pro 6000 / TPU)"]
+        Wheels["Private Wheelhouse Dataset\n<user>/kgsh-wheels-* (manylinux_x86_64)"]
+        Offline["offline_runner.py\nInline <=512KB Tar or .kgsh Dataset"]
+        HostSSE["Kaggle Host Orchestrator\n/api/v1/kernels/logs/stream (SSE)"]
+    end
+
+    Agent <-->|"MCP stdio"| Server
+    Server <--> Store
+    Server -->|"kernels_push"| Boot
+    Boot --> Sup & PTY & Jobs & Dog
+    Sup -.->|"Publish tunnel_url"| StateDS
+    StateDS -.->|"Auto-healing lookup"| Server
+    Server <-->|"HTTPS + 256-bit Bearer HMAC"| Sup
+
+    Server -->|"pip download"| Wheels
+    Server -->|"kernels_push (enable_internet=false)"| Offline
+    Wheels --> Offline
+    Offline -->|"stdout/stderr"| HostSSE
+    HostSSE -->|"Bounded Window Collector"| Server
 ```
 
-### 3.2. Lựa chọn lớp truyền tải (Transport Layer)
+---
 
-#### Phương án A (Khuyên dùng): Tailscale Userspace (`netstack`) + Ephemeral Auth Key
-* **Cơ chế**: Tạo một Ephemeral Auth Key (`tskey-auth-...`) trong Tailscale Admin. Khi Kaggle container boot lên, script tải binary tĩnh của Tailscale (không cần quyền `apt`/root), chạy `tailscaled --tun=userspace-networking` và join vào mạng riêng với hostname cố định (ví dụ `kaggle-worker`).
-* **Ưu điểm vượt trội**:
-  1. **Địa chỉ cố định**: Máy local gọi thẳng `http://kaggle-worker:8765` qua MagicDNS, không cần cơ chế phức tạp để gửi URL/port ngẫu nhiên từ Kaggle về máy local.
-  2. **Bảo mật mặc định**: Không phơi bất kỳ port nào ra Internet công cộng (tránh quét port và giảm rủi ro bị hệ thống bảo mật chặn như domain `ngrok`).
-  3. **Tự dọn rác**: Cờ Ephemeral giúp Tailscale tự xóa node khỏi danh sách thiết bị ngay khi container Kaggle tắt.
-* **Lưu ý trên Windows/Linux local**: Máy local chỉ cần bật sẵn ứng dụng Tailscale thông thường cùng tài khoản.
+## 3. Core Mechanisms
 
-#### Phương án B (Không cần cài VPN ở máy local): `cloudflared` Quick Tunnel + Private Dataset Handshake
-* **Cơ chế**: Worker trên Kaggle tải binary `cloudflared`, mở tunnel `cloudflared tunnel --url http://127.0.0.1:8765`, đọc stderr lấy URL `https://xxxx.trycloudflare.com`, sau đó ghi URL này lên một **Private Kaggle Dataset** (hoặc GitHub Gist bí mật) thông qua Kaggle API có sẵn. `kaggle_mcp` ở máy local poll Dataset đó để lấy địa chỉ kết nối và xác thực bằng `HMAC / Bearer Token` 256-bit.
+### 3.1. Zero-Contention Multi-Slot Isolation (`config.py`, `launcher.py`)
+Running two GPU sessions simultaneously on one Kaggle account fails if both sessions share a single kernel slug or state dataset. `kaggle-shell-mcp` isolates every resource by a normalized `slot` identifier (`"1"`, `"2"`, `"comp-1"`, etc.):
+
+- **Backward-Compatible Naming**:
+  - `slot="1"` (default) maps to `<user>/kaggle-mcp-worker` and `<user>/kaggle-mcp-state`.
+  - Any additional `slot="<id>"` maps to `<user>/kaggle-mcp-worker-<id>` and `<user>/kaggle-mcp-state-<id>`.
+  - Batch runs map to `<user>/kaggle-mcp-worker-batch[-<id>]`.
+- **Parallel Provisioning (`slot="1,2"`)**: `launch_workers_multi` uses a thread pool with per-slot staging directories (`.kaggle_mcp/build_bundle_<slot>`) so concurrent `kernels_push` calls never overwrite each other's rendered scripts or `kernel-metadata.json`.
+- **Cross-Process Atomic State Store**: Access to `.kaggle_mcp/sessions.json` is serialized by both an in-process `threading.RLock` and an OS-level byte-range/advisory lock (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX) plus atomic temp-file rename (`os.replace`).
+
+### 3.2. Zero-Setup Tunnel & Auto-Healing Handshake (`worker_template.py`, `client.py`)
+1. On `kaggle_up`, the local launcher generates a fresh 12-byte `session_id` and a 32-byte (256-bit) `worker_token`, base64-encodes the bootstrap configuration into `worker_template.py`, and pushes the private script kernel.
+2. Inside Kaggle, `cloudflared_supervisor` downloads the static `cloudflared-linux-amd64` binary into `/tmp`, opens a tunnel to `http://127.0.0.1:8765`, parses the generated `https://*.trycloudflare.com` URL, and publishes `state.json` to the slot's **private** Kaggle Dataset (`<user>/kaggle-mcp-state[-<slot>]`).
+3. If `cloudflared` drops mid-session during a 12-hour run, the supervisor respawns it within 3 seconds and publishes the new URL. On the local side, `WorkerClient` detects `ConnectError` / `502` / `530`, refreshes `state.json` from the private Dataset, verifies `/ping` matches `session_id`, updates `sessions.json`, and transparently retries the RPC.
+
+### 3.3. Stateful PTY Execution & Echo-Immune Sentinel Framing (`worker_template.py`)
+Agent tool calls need persistent shell state (`cd`, `export`, activated virtual environments) without hanging indefinitely or misreading echoed input:
+- `PtySession` allocates a Linux pseudo-terminal (`pty.openpty()`) configured to `40×160` (`TIOCSWINSZ`) with `stty -echo` and `TERM=dumb`.
+- Every command appends a split-quote `printf` sentinel:
+  ```bash
+  __mcp_ec=$?; printf '\n__MCP_END_%s__:%d:%s\n' '<half1>''<half2>' "$__mcp_ec" "$PWD"
+  ```
+  Because the input contains single quotes splitting the UUID in half while `printf` emits the concatenated UUID, terminal echo (even if re-enabled by a child binary) can never prematurely trigger sentinel detection.
+- If a foreground command exceeds `timeout_sec`, `PtySession` sends `SIGINT` (`\x03`), drains remaining bytes, and returns partial output with `timed_out=True` so the shell remains usable for subsequent calls.
+
+### 3.4. Detached GPU Jobs & Context-Window Protection (`worker_template.py`)
+Long training runs should never be tied to an HTTP request lifetime:
+- `JobManager.spawn` starts commands in a new process group (`start_new_session=True`), optionally pinning `CUDA_VISIBLE_DEVICES=<gpu_ids>` per job, and redirects output to `/kaggle/working/mcp_logs/<job_id>.log`.
+- Combining `slot="1,2"` (`2 VMs × 2 Tesla T4 GPUs`) with `gpu_ids="0"` / `"1"` lets an Agent run **4 isolated 15 GB GPU jobs simultaneously**; `job_kill` signals the entire process group (`os.killpg`) so child `torchrun` workers release VRAM cleanly.
+- `clean_tqdm` collapses intermediate carriage-return (`\r`) frames and strips ANSI cursor-movement sequences before returning logs over MCP, preventing `tqdm` progress bars from flooding LLM context windows.
+
+### 3.5. Offline Competition Engine & Bounded Host SSE (`batch.py`)
+When targeting restricted competition accelerators (`NvidiaL4x4`, `NvidiaRtxPro6000`) where `enable_internet: false` blocks outbound tunnels:
+1. **Linux Wheelhouse (`kaggle_wheelhouse`)**: Downloads `manylinux2014_x86_64` / `manylinux_2_28_x86_64` binary `.whl` files matching the target CPython ABI (`cp312` / `cp313`) from any host OS (including Windows) and uploads them as a reusable private Kaggle Dataset.
+2. **Atomic Code Delivery (`kaggle_batch_run`)**:
+   - Source bundles `<= 512 KB` compressed are embedded directly inside `offline_runner.py` as base64—eliminating dataset creation latency and indexing races completely.
+   - Larger bundles (`> 512 KB`) are uploaded to a private Dataset with a `.kgsh` extension (preventing Kaggle's GCS ingestion pipeline from auto-extracting `.tar.gz` archives) and verified via `dataset_list_files` before pushing the kernel.
+   - At runtime, `offline_runner.py` extracts code into `/tmp/kgsh_batch_work` so `/kaggle/working`'s 20 GB output quota remains untouched for checkpoints and `submission.csv`.
+3. **Bounded Host SSE Log Reader (`collect_stream_window`)**:
+   - Kaggle's host-level `GET /api/v1/kernels/logs/stream/{owner}/{slug}` streams container stdout over Server-Sent Events (`text/event-stream`) even when container networking is disabled, but blocks until kernel completion.
+   - `collect_stream_window` runs the SSE generator on a daemon thread feeding a `queue.Queue` with a bounded window (`wait_sec`) and early idle break (`idle_break_sec`), then closes the generator (`response.close()`) and caches cumulative output locally—providing instant, non-blocking live logs to MCP clients.
+
+### 3.6. Stdout Purity & Security Boundaries
+- **MCP `stdio` Integrity**: Third-party SDKs (`kaggle` / `kagglesdk`) occasionally print warnings or URLs to `sys.stdout`, which would corrupt MCP JSON-RPC frames. Every SDK import and API call in `launcher.py` and `batch.py` executes inside `contextlib.redirect_stdout(sys.stderr)`.
+- **Constant-Time Auth & Safe Extraction**: All worker endpoints (except minimal `/ping` session-ID probes) verify `Authorization: Bearer <worker_token>` via `hmac.compare_digest`. Both local and remote tar extractors enforce resolved path-prefix checks and skip symlinks/hardlinks (`filter="data"`).
 
 ---
 
-## 4. Cơ chế vận hành chi tiết (Lifecycle, PTY & Quota Safety)
-
-### 4.1. Cấu hình `kernel-metadata.json` chuẩn
-
-Khi `kaggle_mcp` khởi tạo phiên mới, nó sinh tự động thư mục tạm gồm `bootstrap_worker.py` và `kernel-metadata.json`:
-
-```json
-{
-  "id": "<kaggle_username>/kaggle-mcp-worker",
-  "title": "kaggle-mcp-worker",
-  "code_file": "bootstrap_worker.py",
-  "language": "python",
-  "kernel_type": "script",
-  "is_private": true,
-  "enable_gpu": true,
-  "machine_shape": "NvidiaTeslaT4",
-  "enable_internet": true,
-  "dataset_sources": [],
-  "competition_sources": [],
-  "kernel_sources": []
-}
-```
-
-> **Mẹo giữ bí mật (Secrets)**: Không ghi cứng Auth Key trong code nếu lỡ để public. `is_private: true` đảm bảo kernel riêng tư; ngoài ra `kaggle_mcp` sinh một `WORKER_TOKEN` ngẫu nhiên mỗi phiên chạy, tiêm vào `bootstrap_worker.py` trước khi `push` để chỉ đúng phiên MCP ở local mới gọi được RPC.
-
-### 4.2. Tách bạch 2 chế độ thực thi lệnh cho Agent
-
-Agent điều khiển máy từ xa thường chết ở lỗi **timeout lệnh dài** (ví dụ chạy `python train.py` mất 2 tiếng làm treo cứng lời gọi MCP tool hoặc đứt mạng giữa chừng làm chết tiến trình con). Worker Daemon phải tách thành 2 cơ chế:
-
-1. **Stateful PTY / Quick Exec (`term_exec`)**:
-   * Dùng cho lệnh khám phá và cài đặt nhanh (`nvidia-smi`, `ls -la`, `uv pip install ...`, `git clone`, kiểm tra dữ liệu).
-   * Giữ một hoặc nhiều phiên `bash` qua `pty.openpty()` (Linux trên Kaggle hỗ trợ đầy đủ `pty`), bảo toàn thư mục hiện tại (`cwd`), biến môi trường (`export ...`) và `conda`/`venv` giữa các lần Agent gọi tool.
-   * Có timeout mặc định (ví dụ `60s`); nếu quá giờ mà lệnh vẫn chạy, trả về output hiện có kèm cảnh báo tiến trình vẫn đang chạy hoặc gợi ý chuyển sang `job_spawn`.
-
-2. **Detached Background Job (`job_spawn` / `job_status` / `job_logs` / `job_kill`)**:
-   * Dùng cho các tác vụ GPU nặng chạy hàng giờ (`python train.py`, `torchrun --nproc_per_node=2 ...`).
-   * Khởi chạy với `start_new_session=True`, ghi trực tiếp stdout/stderr ra file log xoay vòng tại `/kaggle/working/logs/<job_id>.log` kèm lưu PID + exit code.
-   * Dù kết nối mạng giữa máy local và Kaggle có chập chờn hay Agent khởi động lại, tiến trình train trên 2 card T4 vẫn chạy bình thường. Agent chỉ việc gọi `job_logs(job_id, tail=100)` để theo dõi loss/metrics.
-
-### 4.3. Hai bộ đếm bảo vệ sống còn (Watchdogs)
-
-Đây là phần quyết định công cụ có dùng thực tế được hay không:
-
-1. **Bộ đếm trần 12h (`kMaxLifetimeSec = 42000` — tức 11 giờ 40 phút)**:
-   * Ngay khi `bootstrap_worker.py` chạy, ghi lại `t_start = time.monotonic()`.
-   * Ở mốc **11h35m**: gửi tín hiệu `SIGTERM` cho các job đang chạy để script train có 5 phút lưu checkpoint cuối cùng vào `/kaggle/working/checkpoints/`.
-   * Ở mốc **11h40m**: đóng daemon, dừng `tailscaled`, và gọi `sys.exit(0)`.
-   * **Lý do bắt buộc**: Khi tiến trình chính kết thúc với mã `0` trước mốc 12h00m, Kaggle đánh dấu phiên commit là `COMPLETE` và lưu toàn bộ dữ liệu trong `/kaggle/working` (tối đa 20 GB) thành Kernel Output (có thể tải về bằng `kaggle kernels output` hoặc gắn làm input cho phiên 12h kế tiếp). Nếu để quá 12h00m bị hệ thống giết cứng, trạng thái là `ERROR/TIMEOUT` và dễ mất trắng dữ liệu.
-
-2. **Bộ đếm chống cháy Quota (`kIdleTimeoutSec = 1800` — 30 phút)**:
-   * Mỗi phút kiểm tra 3 điều kiện:
-     * Thời gian từ lần cuối MCP gọi API (`last_rpc_ts`) > 30 phút?
-     * Danh sách background jobs (`job_spawn`) đều đã kết thúc?
-     * Mức sử dụng GPU (`nvidia-smi --query-gpu=utilization.gpu`) < 2% liên tục trong 10 phút?
-   * Nếu **cả 3 đều đúng** → tự động `sys.exit(0)` để thu hồi máy, bảo vệ quỹ 30 giờ GPU/tuần khi người dùng tắt máy đi ngủ mà quên đóng phiên.
-
-### 4.4. Nối tiếp nhiều phiên > 12h (Session Chaining)
-
-Khi bài toán cần train 24–30 tiếng:
-1. Phiên 1 chạy tới `11h40m` → lưu `last.pt` vào `/kaggle/working/` → tự thoát `exit(0)`.
-2. `kaggle_mcp` ở máy local phát hiện phiên 1 chuyển sang `COMPLETE`, tự động kéo checkpoint quan trọng về hoặc thêm `"kernel_sources": ["<user>/kaggle-mcp-worker"]` vào `kernel-metadata.json` của phiên 2 (Kaggle cho phép mount output `/kaggle/working` của lần chạy trước vào `/kaggle/input/...` của lần chạy sau hoàn toàn miễn phí băng thông nội bộ).
-3. Push phiên 2 và tiếp tục chạy từ `last.pt`.
-
----
-
-## 5. Thiết kế tập lệnh MCP Tools cho Agent
-
-Server `kaggle_mcp` chạy dưới dạng `stdio` local MCP (viết bằng Python `mcp` SDK / `FastMCP`), cung cấp cho Agent 9 tools gọn, rõ nghĩa:
-
-| Tên MCP Tool | Tham số chính | Chức năng cho Agent |
-| :--- | :--- | :--- |
-| `kaggle_up` | `gpu=True`, `idle_timeout_min=30`, `mount_datasets=[]` | Sinh bootstrap, gọi `kaggle kernels push`, đợi container lên mạng Tailnet (~60–120s) và trả về thông tin GPU (`nvidia-smi`) |
-| `kaggle_status` | *(không)* | Kiểm tra trạng thái kernel trên Kaggle API + uptime còn lại (đếm ngược tới mốc 11h40m), mức dùng RAM/Disk `/kaggle/working`, % VRAM của 2 card T4 |
-| `kaggle_down` | `pull_outputs=False` | Ra lệnh cho worker kết thúc sạch (`exit 0`) ngay lập tức để dừng tính giờ GPU; tùy chọn kéo file từ `/kaggle/working` về máy |
-| `term_exec` | `command`, `session="default"`, `timeout_sec=60` | Chạy lệnh bash trực tiếp trong PTY có trạng thái (giữ nguyên `cd`, biến môi trường, virtualenv) và trả về `stdout`/`stderr`/`exit_code` |
-| `job_spawn` | `command`, `cwd="/kaggle/working"`, `name` | Chạy ngầm tác vụ dài hạn (training, convert model, tải dataset lớn), trả về `job_id` và `pid` ngay lập tức |
-| `job_list` | *(không)* | Liệt kê mọi background job đang chạy hoặc đã xong kèm runtime, trạng thái và dung lượng log |
-| `job_logs` | `job_id`, `tail_lines=100`, `grep=""` | Đọc các dòng cuối của log tiến trình ngầm (tránh tràn context của Agent khi thanh tiến trình `tqdm` in quá dài) |
-| `job_kill` | `job_id`, `signal="SIGTERM"` | Dừng tiến trình chạy ngầm theo `job_id` |
-| `fs_sync` | `direction="push"\|"pull"`, `local_path`, `remote_path` | Đẩy code/project từ máy local lên Kaggle (nén `.tar.zst` tự bỏ qua `.git`, `__pycache__`, `.venv`) hoặc kéo model/kết quả từ Kaggle về máy |
-
-> **Xử lý chống tràn Context cho Agent**: Các thư viện ML như PyTorch/HuggingFace sinh thanh `tqdm` chứa hàng ngàn ký tự `\r` làm tốn token của Agent. Ở tầng Worker Daemon, hàm đọc `job_logs` và `term_exec` cần lọc bỏ các frame trung gian của `\r` (chỉ giữ trạng thái cuối cùng của mỗi dòng carriage-return) trước khi trả chuỗi về MCP.
-
----
-
-## 6. Cấu trúc thư mục mã nguồn dự kiến (`kaggle_mcp`)
+## 4. Module Map
 
 ```text
-kaggle_mcp/
-├── pyproject.toml                 # Khai báo dependencies: mcp, httpx, kaggle, pydantic
-├── ARCHITECTURE.md                # Tài liệu thiết kế này
-├── .env.example                   # KAGGLE_USERNAME, KAGGLE_KEY, TS_AUTHKEY
-└── src/
-    └── kaggle_mcp/
-        ├── __init__.py
-        ├── server.py              # Điểm vào MCP Server (định nghĩa 9 tools cho Agent)
-        ├── config.py              # Đọc cấu hình, giới hạn thời gian (11h40m, idle 30m)
-        ├── launcher.py            # Sinh kernel-metadata.json, tiêm biến, gọi Kaggle API push/status
-        ├── client.py              # HTTP/WS client gọi vào node Kaggle qua Tailnet / Tunnel
-        ├── sync.py                # Nén tar/gzip đồng bộ thư mục code local <-> remote nhanh
-        └── remote/
-            └── worker_template.py # File tự thân (zero-external-dep hoặc tự cài nhẹ) chạy trên Kaggle:
-                                   #   1. Tải & bật tailscaled (--tun=userspace-networking)
-                                   #   2. Mở HTTP RPC server (stdlib/FastAPI) + quản lý PTY & Jobs
-                                   #   3. Chạy vòng lặp Watchdog (11h40m drain + Idle GPU check)
+kaggle-shell-mcp/
+├── pyproject.toml                     # Package metadata & CLI entrypoints (kgsh, kaggle-shell-mcp, kaggle-mcp)
+├── ARCHITECTURE.md                    # System architecture & protocol internals
+├── README.md                          # English quickstart & reference
+├── docs/README.vi.md                  # Vietnamese quickstart & reference
+├── src/kaggle_mcp/
+│   ├── __init__.py                    # Version & package metadata
+│   ├── accelerators.py                # Hardware alias resolver (T4, L4x4, RTX Pro 6000, H100, TPU, CPU) & caps
+│   ├── config.py                      # .env loader, KGAT_ token setup, file-locked multi-slot sessions.json
+│   ├── launcher.py                    # Multi-slot live bootstrap builder, source validator & parallel launcher
+│   ├── client.py                      # Slotted HTTPS RPC client with auto-healing tunnel refresh
+│   ├── batch.py                       # Offline wheelhouse builder, batch runner & bounded Host SSE log reader
+│   ├── sync.py                        # Filtered .tar.gz packer/unpacker with path-traversal guards
+│   ├── server.py                      # 12 MCP tools + standalone kgsh CLI parser
+│   └── remote/
+│       └── worker_template.py         # Zero-dep stdlib remote daemon (PTY, JobManager, tunnels & watchdogs)
+└── tests/                             # Offline pytest suite (accelerators, multi-slot locking, SSE, sync, stdio)
 ```
-
----
-
-## 7. Lưu ý vận hành, Bảo mật & Rủi ro nền tảng
-
-1. **Điều khoản dịch vụ (Kaggle ToS)**:
-   * Kaggle cấp GPU miễn phí cho mục đích khoa học dữ liệu, học máy và thi đấu ML; điều khoản cấm biến notebook thành máy chủ dịch vụ web công cộng dài hạn, đào tiền số, hoặc làm proxy mạng.
-   * Chỉ sử dụng cho tác vụ chạy code/huấn luyện mô hình cá nhân của mình, giữ kết nối nội bộ kín (Tailscale riêng tư), không phơi dịch vụ công khai và luôn bật Idle Watchdog để giải phóng máy ngay khi xong việc.
-2. **Giới hạn 1 phiên GPU đồng thời**:
-   * Tài khoản Kaggle miễn phí thường chỉ cho phép chạy tối đa **1 hoặc 2 phiên GPU commit đồng thời**. Trước khi `kaggle_up` đẩy phiên mới, `launcher.py` phải gọi `kaggle kernels status` kiểm tra xem phiên cũ đã dừng hẳn chưa để tránh lỗi xếp hàng (`QUEUED` vô tận) hoặc đốt gấp đôi quota.
-3. **Tận dụng đủ 2 GPU (`T4 x2`)**:
-   * Cấu hình `NvidiaTeslaT4` cấp **2 GPU rời** (`cuda:0` và `cuda:1`, mỗi card 15 GB VRAM). Nếu chỉ chạy `python train.py` thông thường, PyTorch chỉ dùng 1 card. Agent có thể tận dụng cả 30 GB VRAM bằng `accelerate launch --num_processes=2` hoặc `torchrun --nproc_per_node=2` (hoặc đặt `device_map="auto"` khi chạy LLM/fine-tune LoRA).

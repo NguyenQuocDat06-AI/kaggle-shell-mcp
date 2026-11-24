@@ -1,4 +1,4 @@
-"""Kaggle API orchestration: kernel bootstrap push, private dataset handshake, output pull."""
+"""Kaggle API orchestration: multi-slot kernel bootstrap, accelerator & model mounts, output pull."""
 
 from __future__ import annotations
 
@@ -9,25 +9,34 @@ import secrets
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from .accelerators import resolve_accelerator
 from .config import (
-    DRAIN_AT_SEC,
-    MAX_LIFETIME_SEC,
     STATE_DIR,
     ActiveSession,
     Settings,
     configure_kaggle_env,
     load_active_session,
+    normalize_slot,
     save_active_session,
 )
 
+TERMINAL_KERNEL_STATUSES = {
+    "COMPLETE",
+    "ERROR",
+    "CANCELLED",
+    "CANCEL_ACKNOWLEDGED",
+    "CANCEL_REQUESTED",
+}
+
 
 @contextlib.contextmanager
-def _protect_stdout():
+def protect_stdout():
     """Redirect stdout to stderr during Kaggle SDK calls so MCP stdio stays clean."""
     with contextlib.redirect_stdout(sys.stderr):
         yield
@@ -35,7 +44,7 @@ def _protect_stdout():
 
 def get_kaggle_api(settings: Settings):
     configure_kaggle_env(settings.kaggle_username, settings.kaggle_secret)
-    with _protect_stdout():
+    with protect_stdout():
         from kaggle.api.kaggle_api_extended import KaggleApi
 
         api = KaggleApi()
@@ -43,10 +52,48 @@ def get_kaggle_api(settings: Settings):
         return api
 
 
+def normalize_str_list(val: str | list[str] | None) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [s.strip() for s in val.split(",") if s.strip()]
+    return [str(s).strip() for s in val if str(s).strip()]
+
+
+def validate_push_response(push_resp: Any) -> int | None:
+    """Validate ApiSaveKernelResponse for errors or invalid dataset/competition/model sources."""
+    push_err = getattr(push_resp, "error", None)
+    if push_err:
+        raise RuntimeError(f"Kaggle kernels_push failed: {push_err}")
+
+    bad_comp = getattr(push_resp, "invalid_competition_sources", None) or []
+    bad_ds = getattr(push_resp, "invalid_dataset_sources", None) or []
+    bad_mdl = getattr(push_resp, "invalid_model_sources", None) or []
+    bad_krn = getattr(push_resp, "invalid_kernel_sources", None) or []
+
+    problems: list[str] = []
+    if bad_comp:
+        problems.append(
+            f"invalid_competition_sources={bad_comp} (check slug & accept competition rules on kaggle.com)"
+        )
+    if bad_ds:
+        problems.append(f"invalid_dataset_sources={bad_ds}")
+    if bad_mdl:
+        problems.append(f"invalid_model_sources={bad_mdl}")
+    if bad_krn:
+        problems.append(f"invalid_kernel_sources={bad_krn}")
+
+    if problems:
+        raise RuntimeError("Kaggle rejected attached sources: " + "; ".join(problems))
+
+    ver = getattr(push_resp, "version_number", None)
+    return int(ver) if ver is not None else None
+
+
 def get_kernel_status(api: Any, kernel_ref: str) -> dict[str, str]:
     """Return normalized {'status': ..., 'failure_message': ...} for a Kaggle kernel."""
     try:
-        with _protect_stdout():
+        with protect_stdout():
             resp = api.kernels_status(kernel_ref)
         raw_status = getattr(resp, "status", resp)
         name = getattr(raw_status, "name", str(raw_status)).split(".")[-1].upper()
@@ -60,27 +107,29 @@ def get_kernel_status(api: Any, kernel_ref: str) -> dict[str, str]:
         return {"status": "UNKNOWN", "failure_message": msg}
 
 
-def ensure_state_dataset(api: Any, settings: Settings) -> None:
-    """Ensure private handshake dataset <user>/kaggle-mcp-state exists."""
+def ensure_state_dataset(api: Any, settings: Settings, slot: str = "1") -> str:
+    """Ensure private handshake dataset <user>/kaggle-mcp-state[-<slot>] exists."""
+    ds_ref = settings.state_dataset_ref_for_slot(slot)
+    ds_slug = settings.state_dataset_slug_for_slot(slot)
     try:
-        with _protect_stdout():
-            api.dataset_list_files(settings.state_dataset_ref)
-        return
+        with protect_stdout():
+            api.dataset_list_files(ds_ref)
+        return ds_ref
     except Exception:
         pass
 
-    with tempfile.TemporaryDirectory(prefix="kaggle_mcp_init_ds_") as tmp:
+    with tempfile.TemporaryDirectory(prefix=f"kaggle_mcp_init_ds_{normalize_slot(slot)}_") as tmp:
         tmp_p = Path(tmp)
         meta = {
-            "title": settings.state_dataset_slug,
-            "id": settings.state_dataset_ref,
+            "title": ds_slug,
+            "id": ds_ref,
             "licenses": [{"name": "CC0-1.0"}],
         }
         (tmp_p / "dataset-metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        init_state = {"session_id": "init", "status": "initialized", "updated_at": time.time()}
+        init_state = {"session_id": "init", "slot": normalize_slot(slot), "status": "initialized", "updated_at": time.time()}
         (tmp_p / "state.json").write_text(json.dumps(init_state, indent=2), encoding="utf-8")
 
-        with _protect_stdout():
+        with protect_stdout():
             api.dataset_create_new(
                 folder=str(tmp_p),
                 public=False,
@@ -88,17 +137,18 @@ def ensure_state_dataset(api: Any, settings: Settings) -> None:
                 convert_to_csv=False,
                 dir_mode="skip",
             )
-    # Give Kaggle backend a brief moment to register the new private dataset slug
     time.sleep(4.0)
+    return ds_ref
 
 
-def fetch_remote_state(api: Any, settings: Settings) -> dict[str, Any] | None:
-    """Download and parse state.json from the private handshake dataset."""
+def fetch_remote_state(api: Any, settings: Settings, slot: str = "1") -> dict[str, Any] | None:
+    """Download and parse state.json from the slot's private handshake dataset."""
+    ds_ref = settings.state_dataset_ref_for_slot(slot)
     try:
-        with tempfile.TemporaryDirectory(prefix="kaggle_mcp_state_") as tmp:
-            with _protect_stdout():
+        with tempfile.TemporaryDirectory(prefix=f"kaggle_mcp_state_{normalize_slot(slot)}_") as tmp:
+            with protect_stdout():
                 api.dataset_download_files(
-                    settings.state_dataset_ref,
+                    ds_ref,
                     path=tmp,
                     force=True,
                     quiet=True,
@@ -131,12 +181,23 @@ def build_bootstrap_bundle(
     settings: Settings,
     session_id: str,
     worker_token: str,
-    gpu: bool,
-    idle_timeout_min: int,
-    mount_datasets: list[str] | None,
-    chain_previous_output: bool,
+    gpu: bool = True,
+    idle_timeout_min: int = 0,
+    mount_datasets: list[str] | None = None,
+    chain_previous_output: bool = False,
+    *,
+    slot: str = "1",
+    accelerator: str | None = None,
+    competition: str | list[str] | None = None,
+    mount_models: list[str] | None = None,
 ) -> Path:
-    bundle_dir = STATE_DIR / "build_bundle"
+    s = normalize_slot(slot)
+    acc_spec = resolve_accelerator(accelerator, gpu=gpu)
+    kernel_ref = settings.kernel_ref_for_slot(s, mode="live")
+    kernel_slug = settings.kernel_slug_for_slot(s, mode="live")
+    state_ds_ref = settings.state_dataset_ref_for_slot(s)
+
+    bundle_dir = STATE_DIR / f"build_bundle_{s}"
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     template_path = Path(__file__).resolve().parent / "remote" / "worker_template.py"
@@ -144,36 +205,43 @@ def build_bootstrap_bundle(
 
     worker_cfg = {
         "session_id": session_id,
+        "slot": s,
         "worker_token": worker_token,
         "kaggle_username": settings.kaggle_username,
         "kaggle_secret": settings.kaggle_secret,
-        "state_dataset_ref": settings.state_dataset_ref,
+        "state_dataset_ref": state_ds_ref,
         "ts_authkey": settings.ts_authkey,
-        "ts_hostname": settings.ts_hostname,
+        "ts_hostname": settings.ts_hostname_for_slot(s),
         "idle_timeout_sec": max(0, int(idle_timeout_min) * 60),
-        "max_lifetime_sec": MAX_LIFETIME_SEC,
-        "drain_at_sec": DRAIN_AT_SEC,
+        "max_lifetime_sec": acc_spec.max_lifetime_sec,
+        "drain_at_sec": acc_spec.drain_at_sec,
         "rpc_port": 8765,
     }
     b64_cfg = base64.b64encode(json.dumps(worker_cfg).encode("utf-8")).decode("ascii")
     rendered_worker = template_code.replace("__BOOTSTRAP_CONFIG_B64__", b64_cfg)
     (bundle_dir / "bootstrap_worker.py").write_text(rendered_worker, encoding="utf-8")
 
+    comp_list = normalize_str_list(competition)
+    ds_list = normalize_str_list(mount_datasets)
+    mdl_list = normalize_str_list(mount_models)
+
     kernel_meta: dict[str, Any] = {
-        "id": settings.kernel_ref,
-        "title": settings.kernel_slug,
+        "id": kernel_ref,
+        "title": kernel_slug,
         "code_file": "bootstrap_worker.py",
         "language": "python",
         "kernel_type": "script",
         "is_private": True,
-        "enable_gpu": bool(gpu),
+        "enable_gpu": acc_spec.enable_gpu,
+        "enable_tpu": acc_spec.enable_tpu,
         "enable_internet": True,
-        "dataset_sources": list(mount_datasets or []),
-        "competition_sources": [],
-        "kernel_sources": [settings.kernel_ref] if chain_previous_output else [],
+        "dataset_sources": ds_list,
+        "competition_sources": comp_list,
+        "kernel_sources": [kernel_ref] if chain_previous_output else [],
+        "model_sources": mdl_list,
     }
-    if gpu:
-        kernel_meta["machine_shape"] = "NvidiaTeslaT4"
+    if acc_spec.machine_shape:
+        kernel_meta["machine_shape"] = acc_spec.machine_shape
 
     (bundle_dir / "kernel-metadata.json").write_text(
         json.dumps(kernel_meta, indent=2),
@@ -190,24 +258,35 @@ def launch_worker(
     chain_previous_output: bool = False,
     wait_ready_sec: int = 240,
     force_new: bool = False,
+    *,
+    slot: str = "1",
+    accelerator: str | None = None,
+    competition: str | list[str] | None = None,
+    mount_models: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Start or reuse a 12h headless Kaggle worker and wait until its RPC tunnel is reachable."""
+    """Start or reuse a headless Kaggle worker in `slot` (supports parallel multi-slot GPU runs)."""
+    s = normalize_slot(slot)
+    acc_spec = resolve_accelerator(accelerator, gpu=gpu)
+    kernel_ref = settings.kernel_ref_for_slot(s, mode="live")
+    state_ds_ref = settings.state_dataset_ref_for_slot(s)
+    comp_list = normalize_str_list(competition)
     api = get_kaggle_api(settings)
 
-    # Reuse live worker if already running and responsive
-    existing = load_active_session()
-    if existing and not force_new:
+    existing = load_active_session(s)
+    if existing and existing.mode == "live" and not force_new:
         ping = probe_worker_ping(existing.base_url, existing.session_id)
         if ping:
             return {
+                "slot": s,
                 "reused_existing": True,
                 "session_id": existing.session_id,
                 "kernel_ref": existing.kernel_ref,
+                "accelerator": existing.accelerator,
                 "endpoint": existing.base_url,
                 "uptime_sec": ping.get("uptime_sec"),
             }
 
-    ensure_state_dataset(api, settings)
+    ensure_state_dataset(api, settings, slot=s)
 
     session_id = secrets.token_hex(12)
     worker_token = secrets.token_hex(32)
@@ -219,32 +298,34 @@ def launch_worker(
         idle_timeout_min=idle_timeout_min,
         mount_datasets=mount_datasets,
         chain_previous_output=chain_previous_output,
+        slot=s,
+        accelerator=accelerator,
+        competition=comp_list,
+        mount_models=mount_models,
     )
 
-    with _protect_stdout():
+    with protect_stdout():
         push_resp = api.kernels_push(
             str(bundle_dir),
-            acc="NvidiaTeslaT4" if gpu else None,
+            acc=acc_spec.machine_shape,
         )
-
-    push_err = getattr(push_resp, "error", None)
-    if push_err:
-        raise RuntimeError(f"Kaggle kernels_push failed: {push_err}")
+    version_number = validate_push_response(push_resp)
 
     deadline = time.monotonic() + max(30, int(wait_ready_sec))
     last_kstatus = "PUSHED"
 
     while time.monotonic() < deadline:
         time.sleep(6.0)
-        kinfo = get_kernel_status(api, settings.kernel_ref)
+        kinfo = get_kernel_status(api, kernel_ref)
         last_kstatus = kinfo["status"]
 
-        if last_kstatus in {"ERROR", "CANCELLED"}:
+        if last_kstatus in {"ERROR", "CANCELLED", "CANCEL_ACKNOWLEDGED"}:
             raise RuntimeError(
-                f"Kaggle kernel entered {last_kstatus}: {kinfo.get('failure_message') or 'check Kaggle logs'}"
+                f"Kaggle kernel ({kernel_ref}) entered {last_kstatus}: "
+                f"{kinfo.get('failure_message') or 'check Kaggle logs (note: some competition GPUs force enable_internet=false; use kaggle_batch_run for offline GPUs)'}"
             )
 
-        rstate = fetch_remote_state(api, settings)
+        rstate = fetch_remote_state(api, settings, slot=s)
         if not rstate or rstate.get("session_id") != session_id:
             continue
 
@@ -258,55 +339,119 @@ def launch_worker(
                 active = ActiveSession(
                     session_id=session_id,
                     worker_token=worker_token,
-                    kernel_ref=settings.kernel_ref,
-                    state_dataset_ref=settings.state_dataset_ref,
+                    kernel_ref=kernel_ref,
+                    state_dataset_ref=state_ds_ref,
                     tunnel_url=tunnel_url,
                     ts_url=ts_url if url == ts_url else "",
                     created_at=time.time(),
                     idle_timeout_min=idle_timeout_min,
+                    slot=s,
+                    mode="live",
+                    accelerator=acc_spec.label,
+                    version_number=version_number,
+                    competition=",".join(comp_list),
+                    enable_internet=True,
                 )
-                save_active_session(active)
+                save_active_session(active, slot=s)
                 return {
+                    "slot": s,
                     "reused_existing": False,
                     "session_id": session_id,
-                    "kernel_ref": settings.kernel_ref,
+                    "kernel_ref": kernel_ref,
+                    "version_number": version_number,
+                    "accelerator": acc_spec.label,
                     "kernel_status": last_kstatus,
                     "endpoint": active.base_url,
                     "gpus": rstate.get("gpus", []),
-                    "max_session_hours": round(MAX_LIFETIME_SEC / 3600, 2),
+                    "max_session_hours": round(acc_spec.max_lifetime_sec / 3600, 2),
                     "idle_timeout_min": idle_timeout_min,
                 }
 
-    # Save pending credentials so kaggle_status can attach once queue finishes
     pending = ActiveSession(
         session_id=session_id,
         worker_token=worker_token,
-        kernel_ref=settings.kernel_ref,
-        state_dataset_ref=settings.state_dataset_ref,
+        kernel_ref=kernel_ref,
+        state_dataset_ref=state_ds_ref,
         created_at=time.time(),
         idle_timeout_min=idle_timeout_min,
+        slot=s,
+        mode="live",
+        accelerator=acc_spec.label,
+        version_number=version_number,
+        competition=",".join(comp_list),
+        enable_internet=True,
     )
-    save_active_session(pending)
+    save_active_session(pending, slot=s)
     return {
+        "slot": s,
         "reused_existing": False,
         "ready": False,
         "session_id": session_id,
-        "kernel_ref": settings.kernel_ref,
+        "kernel_ref": kernel_ref,
+        "version_number": version_number,
+        "accelerator": acc_spec.label,
         "kernel_status": last_kstatus,
         "message": (
-            f"Kernel đã push (status={last_kstatus}) nhưng chưa nhận được tunnel sau {wait_ready_sec}s "
-            "(có thể đang xếp hàng cấp GPU). Gọi kaggle_status sau ít giây để tự kết nối."
+            f"Kernel ({kernel_ref}) đã push (status={last_kstatus}) nhưng chưa nhận được tunnel sau {wait_ready_sec}s "
+            "(đang xếp hàng cấp phát phần cứng). Gọi kaggle_status sau ít giây để tự kết nối."
         ),
     }
 
 
-def pull_kernel_outputs(settings: Settings, local_dest: Path) -> list[str]:
+def launch_workers_multi(
+    settings: Settings,
+    slots: list[str],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Launch multiple Kaggle worker slots concurrently (e.g. slots=['1', '2'] for 2 parallel GPU VMs)."""
+    norm_slots = [normalize_slot(s) for s in slots]
+    if len(norm_slots) == 1:
+        return launch_worker(settings, slot=norm_slots[0], **kwargs)
+
+    results: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+
+    def _run_one(target_slot: str) -> tuple[str, dict[str, Any]]:
+        return target_slot, launch_worker(settings, slot=target_slot, **kwargs)
+
+    with ThreadPoolExecutor(max_workers=min(4, len(norm_slots))) as pool:
+        futures = {pool.submit(_run_one, s): s for s in norm_slots}
+        for fut, s in futures.items():
+            try:
+                _, res = fut.result()
+                results[s] = res
+            except Exception as exc:
+                errors[s] = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "multi_slot": True,
+        "requested_slots": norm_slots,
+        "workers": results,
+        "errors": errors,
+        "note": (
+            "Đang chạy song song nhiều phiên GPU: mỗi phiên trừ giờ độc lập vào quỹ 30h GPU/tuần."
+            if len(results) > 1
+            else ""
+        ),
+    }
+
+
+def pull_kernel_outputs(
+    settings: Settings,
+    local_dest: Path,
+    slot: str = "1",
+    kernel_ref: str = "",
+) -> list[str]:
     api = get_kaggle_api(settings)
+    s = normalize_slot(slot)
+    sess = load_active_session(s)
+    target_ref = kernel_ref or (sess.kernel_ref if sess and sess.kernel_ref else settings.kernel_ref_for_slot(s))
+
     local_dest = local_dest.expanduser().resolve()
     local_dest.mkdir(parents=True, exist_ok=True)
-    with _protect_stdout():
+    with protect_stdout():
         files, _ = api.kernels_output(
-            settings.kernel_ref,
+            target_ref,
             path=str(local_dest),
             force=True,
             quiet=True,

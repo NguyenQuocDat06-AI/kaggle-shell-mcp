@@ -1,65 +1,65 @@
 # kaggle-shell-mcp (`kgsh`) ⚡
 
-**Turn free 12h Kaggle Dual-T4 GPUs into live, stateful remote terminals & detached job runners for AI Agents via MCP.**
+**Turn free 12h Kaggle GPUs into multi-slot live remote terminals & offline competition runners for AI Agents via MCP.**
 
 [![CI](https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![MCP Compatible](https://img.shields.io/badge/MCP-stdio-00A67E.svg)](https://modelcontextprotocol.io/)
 
-[**Tiếng Việt (Vietnamese Guide)**](./docs/README.vi.md) · [**Architecture Spec (VN)**](./ARCHITECTURE.md) · [**Contributing**](./CONTRIBUTING.md)
+[**Tiếng Việt (Vietnamese Guide)**](./docs/README.vi.md) · [**Architecture**](./ARCHITECTURE.md) · [**Changelog**](./CHANGELOG.md) · [**Contributing**](./CONTRIBUTING.md)
 
 ---
 
 ## Why `kaggle-shell-mcp`?
 
-Kaggle offers ~30 hours/week of free **Dual NVIDIA Tesla T4 GPUs (`2 × 15 GB = 30 GB VRAM`)**, yet its official API (`kaggle kernels push`) only supports fire-and-forget batch runs. Existing community scripts either:
-- Push static notebooks and wait blindly for completion, or
-- Require manually pasting `ngrok` tokens into a browser cell, installing `openssh-server`, and fixing broken `CUDA`/`LD_LIBRARY_PATH` variables by hand.
+Kaggle provides ~30 hours/week of free GPU compute, yet its official API (`kaggle kernels push`) only runs fire-and-forget batch scripts, while community SSH notebooks require manual browser clicks, `ngrok` accounts, and manual `CUDA` environment repairs.
 
-**`kaggle-shell-mcp`** (CLI command: **`kgsh`**) bridges the gap in one zero-setup MCP server:
-- **Zero Extra Accounts Required**: Needs **only** `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` bearer token or legacy key). No ngrok account, no VPN client required (optional Tailscale userspace mode is also supported).
-- **100% Native CUDA Environment**: Injects a pure-stdlib Python PTY & RPC daemon directly inside the Kaggle Kernel runtime—preserving Conda, PyTorch, `PATH`, and `LD_LIBRARY_PATH` out of the box.
-- **Agent-First Execution Split**:
-  - `term_exec` — Stateful `/bin/bash` PTY (preserves `cd`, `export`, virtualenvs) for fast interactive exploration and debugging.
-  - `job_spawn` / `job_logs` — Process-group isolated background jobs that survive network drops, with automatic `tqdm` carriage-return (`\r`) compaction so progress bars never blow up LLM context windows.
-- **Built-In Quota & Snapshot Watchdogs**:
-  - **11h40m Safe Drain**: Sends `SIGTERM` at `11h35m` so training loops flush checkpoints, then exits cleanly (`exit 0`) at `11h40m`—ensuring Kaggle commits your `/kaggle/working` (20 GB) output snapshot instead of killing the container at the 12h cliff.
-  - **Optional Idle Guard**: Off by default (`idle_timeout_min=0`) so your worker stays ready up to `11h40m`; pass `idle_timeout_min=30` (or `kgsh up --idle 30`) to enable automatic shutdown when idle with `< 3%` GPU utilization.
+**`kaggle-shell-mcp`** (CLI: **`kgsh`**) gives AI Agents and developers a unified compute bridge:
+
+- **Zero Extra Accounts Required**: Uses **only** `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` bearer token or legacy key). No `ngrok` account or local VPN client needed (optional Tailscale userspace networking is also supported).
+- **Dual Concurrent GPU VMs (`4 × Tesla T4 = 60 GB VRAM`)**: Provision up to **2 parallel Kaggle GPU sessions** (`slot="1,2"`) and pin individual jobs via `gpu_ids="0"` / `"1"` to run **4 isolated GPU experiments simultaneously**.
+- **Full Hardware & Hub Support**: Target `NvidiaTeslaT4` (`2×15 GB`), `NvidiaL4`, `NvidiaL4x4` (`96 GB`), `NvidiaRtxPro6000` (`96 GB`), `NvidiaH100`, `TpuV5E8` / `TpuV6E8`, or `cpu`, with native `competition_sources` and zero-copy Kaggle Hub `model_sources` mounts.
+- **Offline Competition Mode + Live Host SSE Logs**: When high-end competition hardware (`L4x4`, `RTX Pro 6000`) forces `enable_internet=False`, `kgsh` bundles Linux wheels (`kaggle_wheelhouse`) + local code (`kaggle_batch_run`) and streams real-time logs via Kaggle's Host SSE feed (`kaggle_batch_logs`) without opening a browser.
+- **100% Native CUDA + Safe-Drain Watchdogs**:
+  - Pure-stdlib Python PTY & job daemon runs inside the Kernel runtime—preserving Conda, PyTorch, `PATH`, and `LD_LIBRARY_PATH` automatically, while compacting `\r` `tqdm` progress bars.
+  - Sends `SIGTERM` at `11h35m` (`8h35m` on TPU) to flush checkpoints and exits cleanly (`exit 0`) at `11h40m` (`8h40m` on TPU) so Kaggle commits your `/kaggle/working` (20 GB) output snapshot before the hard reaper hits.
 
 ---
 
-## Architecture
+## Architecture Overview
 
 ```mermaid
 flowchart LR
-    subgraph Local["Local Machine (Weak / No GPU)"]
-        Agent["AI Agent\n(Claude / Cursor / Antigravity)"]
-        MCP["kgsh\n(MCP Server & CLI)"]
+    subgraph Local["Local Machine"]
+        Agent["AI Agent / Developer"]
+        MCP["kgsh (MCP Server & CLI)\nFile-Locked Multi-Slot Store"]
     end
 
-    subgraph Kaggle["Kaggle Cloud Container (2x Tesla T4 — Up to 12h)"]
-        Boot["bootstrap_worker.py\n(via kaggle kernels push)"]
-        Tunnel["Auto-Healing Tunnel\n(Cloudflared / Optional Tailscale)"]
-        Daemon["Stdlib RPC Daemon\n(256-bit Bearer HMAC)"]
-        PTY["Stateful Bash PTY"]
-        Jobs["Detached GPU Jobs\n(/kaggle/working/mcp_logs)"]
-        Dog["Watchdogs\n(11h40m Drain + Idle Guard)"]
+    subgraph LiveMode["Mode 1: Live Interactive Slots (slot='1', '2' — Internet ON)"]
+        Tunnel["Auto-Healing Cloudflared\n(or Userspace Tailscale)"]
+        Daemon["Stdlib RPC Daemon\nStateful PTY + GPU-Pinned Jobs"]
     end
 
-    Agent <-->|"MCP stdio"| MCP
-    MCP -->|"1. Push private kernel"| Boot
-    Boot --> Tunnel & Daemon & Dog
-    Tunnel -.->|"2. Private Dataset Handshake\n(<user>/kaggle-mcp-state)"| MCP
-    MCP <-->|"3. Authenticated HTTPS RPC"| Tunnel
-    Daemon --> PTY & Jobs
+    subgraph OfflineMode["Mode 2: Competition Batch Slots (L4x4 / RTX Pro 6000 — Internet OFF)"]
+        Batch["Offline Runner\nWheelhouse + Atomic Code Bundle"]
+        SSE["Kaggle Host SSE Feed\n(Real-Time Logs w/o Internet)"]
+    end
+
+    Agent <-->|"MCP stdio / CLI"| MCP
+    MCP <-->|"256-bit Bearer HTTPS"| Tunnel
+    Tunnel --> Daemon
+    MCP -->|"kernels_push"| Batch
+    SSE -->|"Windowed Stream"| MCP
 ```
+
+See [**ARCHITECTURE.md**](./ARCHITECTURE.md) for deep-dive internals on slot isolation, PTY sentinel framing, and bounded SSE streaming.
 
 ---
 
 ## Quickstart (60 Seconds)
 
-### 1. Install
+### 1. Install (Python 3.11+)
 
 ```bash
 git clone https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp.git
@@ -73,16 +73,16 @@ python -m venv .venv
 ./.venv/bin/pip install -e .
 ```
 
-### 2. Add Your Kaggle Token
+### 2. Configure Credentials
 
-Create a `.env` file in the project root (or pass environment variables directly in your MCP config):
+Create `.env` in the project root (or pass environment variables directly in your MCP client config):
 
 ```ini
 KAGGLE_USERNAME=your_kaggle_username
 KAGGLE_KEY=KGAT_your_api_token_here
 ```
 
-*(Get your token from [kaggle.com/settings](https://www.kaggle.com/settings) → **API** → **Generate New Token**. Make sure your Kaggle account is phone-verified so GPU accelerators are unlocked.)*
+*(Generate your token at [kaggle.com/settings](https://www.kaggle.com/settings) → **API** → **Generate New Token**. Phone verification is required on Kaggle to unlock GPU accelerators.)*
 
 ### 3. Connect Your AI Agent (MCP)
 
@@ -102,7 +102,7 @@ KAGGLE_KEY=KGAT_your_api_token_here
   }
 }
 ```
-*(On Windows, point `"command"` to `C:/path/to/kaggle-shell-mcp/.venv/Scripts/kgsh.exe`. If `.env` is placed in the repo root, the `"env"` block is optional.)*
+*(On Windows, set `"command"` to `C:/path/to/kaggle-shell-mcp/.venv/Scripts/kgsh.exe`.)*
 
 #### Claude Code CLI
 
@@ -112,59 +112,79 @@ claude mcp add kgsh -- /absolute/path/to/kaggle-shell-mcp/.venv/bin/kgsh
 
 ---
 
-## MCP Tools Reference
+## MCP Tools Reference (12 Tools)
 
 | Tool | Purpose |
 | :--- | :--- |
-| `kaggle_up` | Provision a headless Kaggle Dual-T4 worker (`gpu=True`, `idle_timeout_min=0` opt-in, `mount_datasets=[]`, `chain_previous_output=False`) |
-| `kaggle_status` | Inspect kernel status, live Dual-T4 GPU/VRAM %, RAM, `/kaggle/working` free space, and countdown to safe drain |
-| `kaggle_down` | Gracefully terminate the worker (`exit 0`) immediately to stop GPU billing; optionally pull `/kaggle/working` |
-| `term_exec` | Run bash commands in a persistent stateful PTY (`cwd`, shell vars, and virtualenvs persist across calls) |
-| `job_spawn` | Start long-running GPU training/inference in an isolated process group immune to disconnects |
-| `job_list` | List active and completed background jobs with PID, runtime, exit code, and log size |
-| `job_logs` | Read tail lines of a job log (with regex `grep` and automatic `tqdm` `\r` cleanup) |
-| `job_kill` | Send `SIGTERM` or `SIGKILL` to a background job's entire process group and free VRAM |
-| `fs_sync` | `push` local code folders (auto-skipping `.git`, `.venv`, `__pycache__`) or `pull` remote checkpoints/logs via `.tar.gz` |
+| `kaggle_up` | Boot 1 or 2 parallel headless workers (`slot="1"`, `"2"`, or `"1,2"`, `accelerator`, `competition`, `mount_datasets`, `mount_models`, opt-in `idle_timeout_min`) |
+| `kaggle_status` | Inspect live GPU/VRAM telemetry, RAM, disk, and kernel states across `slot="all"` or a specific slot (auto-cleans stale sessions) |
+| `kaggle_down` | Gracefully stop `slot="1"`, `"2"`, or `"all"` (`exit 0`) immediately to save GPU quota; optionally pull `/kaggle/working` |
+| `term_exec` | Run bash commands in a persistent stateful PTY on `slot` (`cwd`, exports, and virtualenvs persist across calls) |
+| `job_spawn` | Launch detached background jobs on `slot` with optional `gpu_ids` (`CUDA_VISIBLE_DEVICES="0"` or `"1"`) |
+| `job_list` | List active and finished background jobs on `slot` with PID, GPU assignment, runtime, and log size |
+| `job_logs` | Read tail lines of a background job log on `slot` (with regex `grep` and automatic `tqdm` `\r` cleanup) |
+| `job_kill` | Send `SIGTERM` or `SIGKILL` to a background job's process group on `slot` and release VRAM |
+| `fs_sync` | `push` local folders (auto-skipping `.git`, `.venv`, `__pycache__`) or `pull` remote checkpoints/logs on `slot` |
+| `kaggle_wheelhouse` | Download Linux `manylinux_x86_64` binary `.whl` packages and publish a private Dataset for no-internet runs |
+| `kaggle_batch_run` | Submit an offline/competition batch job (`NvidiaL4x4`, `NvidiaRtxPro6000`, `TpuV5E8`, `enable_internet=False`) with automatic code bundling |
+| `kaggle_batch_logs` | Stream live or completed logs via Kaggle's Host SSE endpoint—even when container internet is disabled |
 
 ---
 
 ## Standalone CLI Usage (`kgsh`)
 
-Invoke `kgsh` with no arguments to run the MCP `stdio` server, or pass subcommands directly from your terminal:
+### Workflow 1: Single or Dual-VM Interactive GPU Shell
 
 ```bash
-# Check status (costs 0 GPU quota)
+# Boot BOTH Kaggle Dual-T4 VMs in parallel (4x T4 = 60 GB total VRAM)
+kgsh up -s 1,2
+
+# Interactive shell commands on specific slots
+kgsh exec -s 1 "nvidia-smi"
+kgsh push ./my_project /kaggle/working -s 1
+kgsh push ./my_project /kaggle/working -s 2
+
+# Run 4 independent GPU experiments simultaneously across 2 VMs x 2 GPUs
+kgsh spawn -s 1 --gpus 0 "python my_project/train.py --lr 1e-4" --name exp1
+kgsh spawn -s 1 --gpus 1 "python my_project/train.py --lr 3e-4" --name exp2
+kgsh spawn -s 2 --gpus 0 "python my_project/train.py --lr 5e-4" --name exp3
+kgsh spawn -s 2 --gpus 1 "python my_project/train.py --lr 1e-3" --name exp4
+
+# Monitor status & shut down all GPU VMs when finished
 kgsh status
+kgsh down -s all
+```
 
-# Boot a Dual-T4 GPU session (~50s cold start; add --idle 30 for optional idle auto-shutdown)
-kgsh up
+### Workflow 2: Offline Kaggle Competition (`L4x4` / `RTX Pro 6000` with Internet OFF)
 
-# Run interactive commands (stateful PTY)
-kgsh exec "nvidia-smi"
-kgsh push ./my_project /kaggle/working
+```bash
+# 1. (Once) Build an offline Linux wheelhouse dataset
+kgsh wheels peft accelerate bitsandbytes --slug lora-deps --py 312
 
-# Launch a multi-GPU training job across both T4 GPUs (30 GB total VRAM)
-kgsh spawn "torchrun --nproc_per_node=2 my_project/train.py" --name lora-run
-kgsh jobs
-kgsh logs <job_id> --tail 50
+# 2. Bundle local project & launch offline on competition hardware
+kgsh batch-run "torchrun --nproc_per_node=4 solve.py" \
+  --path ./comp_solution \
+  -a l4x4 \
+  --comp arc-prize-2026 \
+  --wheels your_username/kgsh-wheels-lora-deps \
+  --model qwen-lm/qwen2.5/transformers/7b-instruct/1
 
-# Pull checkpoints & shut down immediately to save quota
-kgsh pull /kaggle/working/checkpoints ./checkpoints
-kgsh down
+# 3. Stream live logs from Host SSE without opening a browser
+kgsh batch-logs -s batch-1 --tail 80
 ```
 
 ---
 
 ## Chaining Runs Longer Than 12 Hours
 
-1. Save periodic checkpoints into `/kaggle/working/checkpoints/` inside your training script (and handle `SIGTERM` if desired for the `11h35m` drain hook).
-2. After Session 1 exits cleanly at `11h40m`, start Session 2 with `chain_previous_output=True` (or `kgsh up --chain`). Kaggle mounts Session 1's output directly under `/kaggle/input/kaggle-mcp-worker/` at internal datacenter speeds.
+1. Save periodic checkpoints into `/kaggle/working/checkpoints/` inside your training script (and handle `SIGTERM` for the `11h35m` drain signal).
+2. After Session 1 exits cleanly at `11h40m`, start Session 2 with `chain_previous_output=True` (`kgsh up --chain`). Kaggle mounts Session 1's output directly under `/kaggle/input/` at internal datacenter speeds.
 
 ---
 
 ## Responsible Use
 
-`kaggle-shell-mcp` is built for legitimate machine learning experimentation, model training, and data science workflows on your own Kaggle account. Respect [Kaggle's Terms of Service](https://www.kaggle.com/terms): do not use Kaggle notebooks for crypto-mining, public web hosting, or network proxying, and shut down sessions with `kaggle_down` (or set optional `idle_timeout_min`) when finished so GPUs return to the community pool promptly.
+`kaggle-shell-mcp` is built for legitimate machine learning experimentation, model training, and competition workflows on your own Kaggle account. Respect [Kaggle's Terms of Service](https://www.kaggle.com/terms): do not use Kaggle notebooks for crypto-mining, public web hosting, or network proxying, and shut down active slots (`kgsh down -s all`) when finished. Note that running 2 concurrent GPU slots deducts 2 hours of GPU quota per wall-clock hour.
 
 ## License
 

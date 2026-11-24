@@ -18,11 +18,14 @@ EXPECTED_TOOLS = {
     "job_logs",
     "job_kill",
     "fs_sync",
+    "kaggle_wheelhouse",
+    "kaggle_batch_run",
+    "kaggle_batch_logs",
 }
 
 
 @pytest.mark.asyncio
-async def test_mcp_stdio_registers_all_nine_tools() -> None:
+async def test_mcp_stdio_registers_all_twelve_tools() -> None:
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "kaggle_mcp.server"],

@@ -1,19 +1,23 @@
 # kaggle-shell-mcp (`kgsh`) ⚡ (Tài liệu Tiếng Việt)
 
-**Biến phiên GPU Kaggle 12h miễn phí (Dual NVIDIA T4 × 2 = 30 GB VRAM) thành máy trạm điều khiển trực tiếp qua Terminal & MCP cho AI Agent.**
+**Biến GPU Kaggle 12h miễn phí thành hệ thống Multi-Slot Live Terminal & Offline Competition Runner cho AI Agent qua MCP.**
 
 ---
 
-## Điểm khác biệt của `kaggle-shell-mcp`
+## Điểm nổi bật của `kaggle-shell-mcp` (v0.2)
 
-1. **Không cần cài VPN hay tài khoản trung gian**: Chỉ cần duy nhất `KAGGLE_USERNAME` và `KAGGLE_KEY` (`KGAT_...` hoặc key hex cũ) trong `.env`. Tự động mở đường truyền qua Cloudflare Quick Tunnel và đồng bộ địa chỉ qua Private Dataset `<username>/kaggle-mcp-state` (vẫn hỗ trợ `TS_AUTHKEY` nếu muốn chạy qua mạng riêng Tailscale).
-2. **Giữ nguyên 100% môi trường CUDA/PyTorch**: Không cài `openssh-server` qua `apt`, chạy trực tiếp Python PTY/RPC daemon bên trong tiến trình Kaggle Kernel.
-3. **Tách biệt lệnh ngắn & tiến trình train dài**:
-   - `term_exec`: Bash PTY giữ trạng thái (`cd`, `export`, `conda`/`venv`) cho các thao tác kiểm tra nhanh.
-   - `job_spawn` / `job_logs`: Chạy ngầm độc lập với kết nối mạng, tự gọt ký tự `\r` của thanh `tqdm` để không làm tràn context của Agent.
-4. **Bảo vệ Quota 30h/tuần & Chống mất dữ liệu ở mốc 12h**:
-   - Tự gửi `SIGTERM` lúc `11h35m` và thoát sạch `exit(0)` lúc `11h40m` để Kaggle lưu trọn vẹn 20 GB `/kaggle/working` thay vì bị kill lỗi timeout ở `12h00m`.
-   - Tuỳ chọn bật tự tắt khi rỗi (`idle_timeout_min` / `--idle 30`, mặc định `0` = tắt để giữ phiên sẵn sàng tối đa 11h40m).
+1. **Không cần VPN hay tài khoản trung gian**: Chỉ cần `KAGGLE_USERNAME` và `KAGGLE_KEY` (`KGAT_...` hoặc key hex cũ) trong `.env`. Tự động mở đường truyền Cloudflare Quick Tunnel và trao đổi địa chỉ qua Private Dataset riêng cho từng slot.
+2. **Chạy song song 2 máy GPU cùng lúc (`4 × Tesla T4 = 60 GB VRAM`)**:
+   - Hỗ trợ đa `slot` (`kgsh up -s 1,2`) khởi chạy đồng thời 2 máy ảo GPU độc lập không đụng độ trạng thái.
+   - Hỗ trợ ghim card lẻ (`gpu_ids="0"` hoặc `"1"`) trong `job_spawn` để chạy **4 thí nghiệm GPU độc lập cùng lúc** trên 2 máy.
+3. **Mở khóa toàn bộ Phần cứng, Competition & Kaggle Models**:
+   - Hỗ trợ `t4` (`NvidiaTeslaT4`), `l4`, `l4x4` (`96 GB`), `rtx6000` (`NvidiaRtxPro6000` — `96 GB`), `h100`, `tpuv5e8` / `tpuv6e8` (tự động hạ trần safe drain xuống `8h40m` cho TPU 9h), và `cpu`.
+   - Gắn trực tiếp dữ liệu cuộc thi (`competition_sources`) và model lớn từ Kaggle Hub (`model_sources`) vào `/kaggle/input` trong 0 giây.
+4. **Chế độ Offline Competition + Đọc Live Log không cần Internet**:
+   - Với các giải ép `enable_internet=False` trên `L4x4` / `RTX Pro 6000`, bộ 3 công cụ `kaggle_wheelhouse` + `kaggle_batch_run` + `kaggle_batch_logs` tự đóng gói wheel Linux + code và đọc live log thời gian thực qua luồng **Host SSE** của Kaggle mà không cần mở trình duyệt.
+5. **Giữ 100% môi trường CUDA & Bảo vệ Snapshot `/kaggle/working`**:
+   - Chạy trực tiếp Python PTY/RPC daemon trong tiến trình Kernel, tự lọc ký tự `\r` của thanh `tqdm`.
+   - Tự gửi `SIGTERM` lúc `11h35m` để lưu checkpoint và thoát sạch `exit(0)` lúc `11h40m` trước mốc kill 12h của Kaggle (tuỳ chọn bật thêm tự tắt khi rỗi qua `--idle 30`).
 
 ---
 
@@ -45,26 +49,57 @@ KAGGLE_KEY=KGAT_token_cua_ban
 }
 ```
 
-## Sử dụng nhanh qua dòng lệnh (`kgsh`)
+---
 
+## Danh sách 12 MCP Tools cho AI Agent
+
+| MCP Tool | Chức năng |
+| :--- | :--- |
+| `kaggle_up` | Khởi chạy 1 hoặc 2 máy GPU chạy nền song song (`slot="1"`, `"2"`, hoặc `"1,2"`, chọn `accelerator`, `competition`, `mount_models`) |
+| `kaggle_status` | Xem trạng thái kernel, % GPU/VRAM, RAM, ổ đĩa trên tất cả các slot (`slot="all"`) và tự dọn phiên cũ đã hủy |
+| `kaggle_down` | Tắt sạch 1 slot hoặc toàn bộ (`slot="all"`) ngay lập tức để tiết kiệm giờ GPU; tuỳ chọn kéo `/kaggle/working` |
+| `term_exec` | Chạy lệnh bash tương tác trong PTY giữ trạng thái (`cd`, biến môi trường, `venv`) theo từng `slot` |
+| `job_spawn` | Chạy ngầm tác vụ train dài hạn (rớt mạng không chết), hỗ trợ ghim card lẻ `gpu_ids="0"` hoặc `"1"` |
+| `job_list` | Liệt kê danh sách tiến trình chạy ngầm trên `slot` |
+| `job_logs` | Đọc log tiến trình ngầm (đã tự gọt sạch thanh tiến trình `tqdm` `\r`) |
+| `job_kill` | Gửi `SIGTERM` / `SIGKILL` dừng tiến trình ngầm và giải phóng VRAM |
+| `fs_sync` | Đồng bộ nhanh thư mục code (`push`) hoặc kéo checkpoint/log (`pull`) theo `slot` |
+| `kaggle_wheelhouse` | Tải bộ `.whl` chuẩn Linux `manylinux_x86_64` đẩy lên Private Dataset để cài khi tắt mạng |
+| `kaggle_batch_run` | Đóng gói code chạy giải đấu khóa mạng (`enable_internet=False`) trên `L4x4` / `RTX Pro 6000` / `TPU` |
+| `kaggle_batch_logs` | Đọc live log thời gian thực từ tầng Host SSE của Kaggle kể cả khi container tắt sạch internet |
+
+---
+
+## Ví dụ sử dụng qua CLI (`kgsh`)
+
+### 1. Bật song song 2 máy GPU & chia 4 job trên 4 card T4
 ```powershell
-# Kiểm tra trạng thái (không tốn quota)
+# Bật cùng lúc 2 máy T4x2 (~60–95s)
+kgsh up -s 1,2
+
+# Đẩy code lên cả 2 máy
+kgsh push .\my_app /kaggle/working -s 1
+kgsh push .\my_app /kaggle/working -s 2
+
+# Chạy 4 cấu hình thí nghiệm độc lập trên 4 card GPU
+kgsh spawn -s 1 --gpus 0 "python my_app/train.py --seed 1" --name s1g0
+kgsh spawn -s 1 --gpus 1 "python my_app/train.py --seed 2" --name s1g1
+kgsh spawn -s 2 --gpus 0 "python my_app/train.py --seed 3" --name s2g0
+kgsh spawn -s 2 --gpus 1 "python my_app/train.py --seed 4" --name s2g1
+
+# Kiểm tra tất cả slot & tắt toàn bộ khi xong việc
 kgsh status
+kgsh down -s all
+```
 
-# Bật máy Dual T4 (~50 giây; thêm --idle 30 nếu muốn tự tắt khi rỗi)
-kgsh up
+### 2. Đẩy chạy Competition khóa mạng (`L4x4` / `RTX Pro 6000`)
+```powershell
+# Tải sẵn thư viện Linux đẩy lên Private Dataset (chỉ cần làm 1 lần)
+kgsh wheels peft bitsandbytes --slug lora --py 312
 
-# Chạy lệnh trực tiếp trên máy Kaggle
-kgsh exec "nvidia-smi"
+# Đẩy job offline trên phần cứng cuộc thi
+kgsh batch-run "torchrun --nproc_per_node=4 train.py" --path .\solution -a rtx6000 --comp ten-cuoc-thi --wheels ten_ban/kgsh-wheels-lora
 
-# Đẩy thư mục code từ máy lên /kaggle/working/my_app
-kgsh push .\my_app /kaggle/working
-
-# Chạy train ngầm trên cả 2 card T4
-kgsh spawn "torchrun --nproc_per_node=2 my_app/train.py" --name run1
-kgsh logs <job_id> --tail 50
-
-# Kéo kết quả về & tắt máy ngay để tiết kiệm giờ GPU
-kgsh pull /kaggle/working/outputs .\outputs
-kgsh down
+# Đọc live log trực tiếp không cần mở trình duyệt
+kgsh batch-logs -s batch-1 --tail 80
 ```

@@ -1,6 +1,7 @@
 .env
 .venv/
 .kaggle_mcp/
+ROADMAP.md
 __pycache__/
 *.py[cod]
 build/

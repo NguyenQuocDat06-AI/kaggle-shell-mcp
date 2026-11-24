@@ -1,4 +1,4 @@
-"""Offline tests for auth env setup, bootstrap rendering, and tqdm carriage-return compaction."""
+"""Offline tests for auth env setup, multi-slot bootstrap rendering, and tqdm compaction."""
 
 from __future__ import annotations
 
@@ -27,7 +27,9 @@ def test_configure_kaggle_env_distinguishes_kgat_and_legacy(monkeypatch) -> None
     assert os.environ["KAGGLE_KEY"] == "0123456789abcdef0123456789abcdef"
 
 
-def test_bootstrap_bundle_renders_valid_python_and_metadata(tmp_path: Path, monkeypatch) -> None:
+def test_bootstrap_bundle_renders_slot_accelerator_models_and_competition(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setattr("kaggle_mcp.launcher.STATE_DIR", tmp_path)
     settings = Settings(kaggle_username="tester", kaggle_secret="KGAT_dummy")
 
@@ -39,6 +41,10 @@ def test_bootstrap_bundle_renders_valid_python_and_metadata(tmp_path: Path, monk
         idle_timeout_min=DEFAULT_IDLE_TIMEOUT_MIN,
         mount_datasets=["tester/my-data"],
         chain_previous_output=True,
+        slot="2",
+        accelerator="rtx6000",
+        competition="arc-prize-2026",
+        mount_models=["google/gemma-2/transformers/9b/2"],
     )
 
     worker_src = (bundle / "bootstrap_worker.py").read_text(encoding="utf-8")
@@ -48,14 +54,19 @@ def test_bootstrap_bundle_renders_valid_python_and_metadata(tmp_path: Path, monk
     assert m is not None
     decoded_cfg = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
     assert decoded_cfg["idle_timeout_sec"] == 0
+    assert decoded_cfg["slot"] == "2"
+    assert decoded_cfg["state_dataset_ref"] == "tester/kaggle-mcp-state-2"
 
     meta = json.loads((bundle / "kernel-metadata.json").read_text(encoding="utf-8"))
-    assert meta["id"] == "tester/kaggle-mcp-worker"
+    assert meta["id"] == "tester/kaggle-mcp-worker-2"
     assert meta["enable_gpu"] is True
-    assert meta["machine_shape"] == "NvidiaTeslaT4"
+    assert meta["enable_tpu"] is False
+    assert meta["machine_shape"] == "NvidiaRtxPro6000"
     assert meta["is_private"] is True
     assert meta["dataset_sources"] == ["tester/my-data"]
-    assert meta["kernel_sources"] == ["tester/kaggle-mcp-worker"]
+    assert meta["competition_sources"] == ["arc-prize-2026"]
+    assert meta["model_sources"] == ["google/gemma-2/transformers/9b/2"]
+    assert meta["kernel_sources"] == ["tester/kaggle-mcp-worker-2"]
 
 
 def test_clean_tqdm_collapses_carriage_returns() -> None:

@@ -342,17 +342,22 @@ class JobManager:
         self._procs: dict[str, subprocess.Popen] = {}
         self._log_handles: dict[str, io.BufferedWriter] = {}
 
-    def spawn(self, command: str, cwd: str = "", name: str = "") -> dict:
+    def spawn(self, command: str, cwd: str = "", name: str = "", gpu_ids: str = "") -> dict:
         with self._lock:
             job_id = f"job_{int(time.time())}_{uuid.uuid4().hex[:6]}"
             work_cwd = cwd if (cwd and os.path.isdir(cwd)) else str(WORKING_DIR)
             log_path = LOG_DIR / f"{job_id}.log"
             fh = open(log_path, "wb")
 
+            job_env = os.environ.copy()
+            gpu_ids_clean = str(gpu_ids or "").strip()
+            if gpu_ids_clean:
+                job_env["CUDA_VISIBLE_DEVICES"] = gpu_ids_clean
+
             proc = subprocess.Popen(
                 ["/bin/bash", "-c", command],
                 cwd=work_cwd,
-                env=os.environ.copy(),
+                env=job_env,
                 stdin=subprocess.DEVNULL,
                 stdout=fh,
                 stderr=subprocess.STDOUT,
@@ -364,6 +369,7 @@ class JobManager:
                 "name": name or job_id,
                 "command": command,
                 "cwd": work_cwd,
+                "gpu_ids": gpu_ids_clean,
                 "pid": proc.pid,
                 "status": "running",
                 "exit_code": None,
@@ -784,6 +790,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     command=req["command"],
                     cwd=req.get("cwd", ""),
                     name=req.get("name", ""),
+                    gpu_ids=str(req.get("gpu_ids", "")),
                 )
                 self._send_json(200, meta)
                 return
