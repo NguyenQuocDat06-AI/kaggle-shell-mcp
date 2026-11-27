@@ -9,11 +9,20 @@ import os
 import re
 from pathlib import Path
 
+from kaggle_mcp import config
+from kaggle_mcp.client import (
+    WorkerClient,
+    WorkerSessionStoppedError,
+    summarize_http_error,
+)
 from kaggle_mcp.config import (
     DEFAULT_IDLE_TIMEOUT_MIN,
+    ActiveSession,
     Settings,
     _read_kaggle_json_fallback,
     configure_kaggle_env,
+    load_active_session,
+    save_active_session,
 )
 from kaggle_mcp.launcher import build_bootstrap_bundle
 
@@ -104,3 +113,49 @@ def test_kaggle_json_fallback_for_pypi_installs(tmp_path: Path, monkeypatch) -> 
     user, secret = _read_kaggle_json_fallback()
     assert user == "pypi_user"
     assert secret == "KGAT_from_json"
+
+
+def test_summarize_http_error_sanitizes_cloudflare_530_html() -> None:
+    html_530 = (
+        "<!doctype html>\n"
+        "<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\"> <![endif]-->\n"
+        "<html><head><title>Cloudflare Tunnel error | demo.trycloudflare.com | Cloudflare</title>"
+        "</head><body><h1>Origin unavailable</h1></body></html>"
+    )
+    msg = summarize_http_error("1", 530, html_530)
+    assert "\n" not in msg
+    assert "HTTP 530" in msg
+    assert "tunnel closed" in msg
+    assert "<!doctype" not in msg.lower()
+    assert "<html" not in msg.lower()
+
+
+def test_refresh_endpoint_auto_clears_stopped_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path)
+    settings = Settings(kaggle_username="tester", kaggle_secret="KGAT_dummy")
+    sess = ActiveSession(
+        session_id="sess_stop",
+        worker_token="tok",
+        kernel_ref="tester/kaggle-mcp-worker",
+        tunnel_url="https://dead.trycloudflare.com",
+        slot="1",
+        mode="live",
+        accelerator="CPU",
+    )
+    save_active_session(sess, slot="1")
+
+    monkeypatch.setattr("kaggle_mcp.client.get_kaggle_api", lambda _s: object())
+    monkeypatch.setattr(
+        "kaggle_mcp.client.fetch_remote_state",
+        lambda _a, _s, slot="1": {"session_id": "sess_stop", "status": "stopped"},
+    )
+
+    client = WorkerClient(settings, slot="1")
+    with pytest.raises(WorkerSessionStoppedError):
+        client._refresh_endpoint(sess)
+
+    assert load_active_session("1") is None

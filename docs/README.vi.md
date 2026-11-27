@@ -1,31 +1,43 @@
-# kaggle-shell-mcp (`kgsh`) ⚡ (Tài liệu Tiếng Việt)
+# kaggle-shell-mcp (`kgsh`) — Tài liệu Tiếng Việt
 
-**Biến GPU Kaggle 12h miễn phí thành hệ thống Multi-Slot Live Terminal & Offline Competition Runner cho AI Agent qua MCP.**
+**Biến GPU Kaggle 12h miễn phí thành hệ thống Multi-Slot Live Terminal, File Manager 2 cột 60-FPS & Offline Competition Runner cho AI Agent qua MCP.**
 
----
-
-## Điểm nổi bật của `kaggle-shell-mcp` (v0.2)
-
-1. **Cài đặt 1 dòng qua PyPI / `uvx` — Không cần VPN hay tài khoản trung gian**: Chỉ cần `KAGGLE_USERNAME` và `KAGGLE_KEY` (`KGAT_...`, key hex cũ, hoặc tự nhận sẵn `~/.kaggle/kaggle.json`). Tự động mở đường truyền Cloudflare Quick Tunnel và trao đổi địa chỉ qua Private Dataset riêng cho từng slot.
-2. **Chạy song song 2 máy GPU cùng lúc (`4 × Tesla T4 = 60 GB VRAM`)**:
-   - Hỗ trợ đa `slot` (`kgsh up -s 1,2`) khởi chạy đồng thời 2 máy ảo GPU độc lập không đụng độ trạng thái.
-   - Hỗ trợ ghim card lẻ (`gpu_ids="0"` hoặc `"1"`) trong `job_spawn` để chạy **4 thí nghiệm GPU độc lập cùng lúc** trên 2 máy.
-3. **Mở khóa toàn bộ Phần cứng, Competition & Kaggle Models**:
-   - Hỗ trợ `t4` (`NvidiaTeslaT4`), `l4`, `l4x4` (`96 GB`), `rtx6000` (`NvidiaRtxPro6000` — `96 GB`), `h100`, `tpuv5e8` / `tpuv6e8` (tự động hạ trần safe drain xuống `8h40m` cho TPU 9h), và `cpu`.
-   - Gắn trực tiếp dữ liệu cuộc thi (`competition_sources`) và model lớn từ Kaggle Hub (`model_sources`) vào `/kaggle/input` trong 0 giây.
-4. **Chế độ Offline Competition + Đọc Live Log không cần Internet**:
-   - Với các giải ép `enable_internet=False` trên `L4x4` / `RTX Pro 6000`, bộ 3 công cụ `kaggle_wheelhouse` + `kaggle_batch_run` + `kaggle_batch_logs` tự đóng gói wheel Linux + code và đọc live log thời gian thực qua luồng **Host SSE** của Kaggle mà không cần mở trình duyệt.
-5. **Giữ 100% môi trường CUDA & Bảo vệ Snapshot `/kaggle/working`**:
-   - Chạy trực tiếp Python PTY/RPC daemon trong tiến trình Kernel, tự lọc ký tự `\r` của thanh `tqdm`.
-   - Tự gửi `SIGTERM` lúc `11h35m` để lưu checkpoint và thoát sạch `exit(0)` lúc `11h40m` trước mốc kill 12h của Kaggle (tuỳ chọn bật thêm tự tắt khi rỗi qua `--idle 30`).
+[**English README**](../README.md) · [**Architecture**](../ARCHITECTURE.md) · [**Changelog**](../CHANGELOG.md) · [**Contributing**](../CONTRIBUTING.md)
 
 ---
 
-## Cài đặt & Kết nối MCP (30 giây)
+## Ảnh chụp thực tế giao diện Rust TUI (`kgsh ui`)
 
-### Cách 1: Chạy trực tiếp qua `uvx` (Không cần tự tạo `.venv`)
+### `F1` Cockpit — Shell trực tiếp, Telemetry GPU & Live Job Logs
+Theo dõi theo thời gian thực mọi lệnh `[mcp]` do AI Agent thực thi song song với lệnh `[tui]` của bạn, % GPU/VRAM/RAM/Disk, output vòng lặp đang chạy và log tiến trình train.
 
-Dán thẳng vào `mcp_config.json` của **Claude Desktop / Cursor / Windsurf / Antigravity**:
+![F1 Cockpit — Live Shell, Telemetry GPU và Live Job Logs](./assets/cockpit.svg)
+
+### `F2` Dual-Panel File Manager & Code Preview Drawer
+Quản lý song song thư mục Local (`Trái`) ⇄ Kaggle (`Phải`: `/kaggle/working`, `/kaggle/input`, `/tmp`) với phím điều hướng `←`/`→` kiểu Yazi nhớ vị trí con trỏ, cột `DU%`, multi-select, clipboard (`c`/`x`/`p`), `t` đồng bộ và `v` xem trước code.
+
+![F2 Dual-Panel File Manager và Preview Drawer](./assets/dual_files.svg)
+
+<details>
+<summary><strong>Xem thêm ảnh: Soạn thảo & Bôi chọn văn bản sạch · Quản lý Slot & Weekly Quota</strong></summary>
+
+#### Trình sửa file (`Enter` / `→` 2 lần) — Bôi chọn bằng `Shift` / `Ctrl+Shift` & Chuột
+Khi kéo chuột hoặc giữ `Shift` / `Ctrl+Shift` + mũi tên, trình soạn thảo và các vùng xem log/shell chỉ bôi & copy đúng **nội dung code/text sạch** — không dính nhãn `Path :`, cột số dòng `1 │ ` hay ký tự viền `│`.
+
+![Remote File Editor với bôi chọn nội dung sạch](./assets/editor_selection.svg)
+
+#### Workers, Cluster & Quota (`Ctrl+W` / `F5`)
+Xem số giờ Quota GPU (30h) & TPU (20h) hàng tuần, chuyển đổi / tắt các slot chạy song song và khởi chạy máy ảo từ Boot Profiles đã lưu.
+
+![Modal Workers, Cluster và Weekly Quota](./assets/workers_quota.svg)
+
+</details>
+
+---
+
+## Cài đặt nhanh cho người mới (Không cần cài Rust)
+
+### 1. Gắn cho AI Agent qua `uvx` (Claude Desktop / Cursor / Windsurf / Antigravity)
 
 ```json
 {
@@ -42,75 +54,69 @@ Dán thẳng vào `mcp_config.json` của **Claude Desktop / Cursor / Windsurf /
 }
 ```
 
-Hoặc gắn vào **Claude Code CLI** bằng 1 lệnh:
-```bash
-claude mcp add kgsh -e KAGGLE_USERNAME=ten_ban -e KAGGLE_KEY=KGAT_token -- uvx --from kaggle-shell-mcp kgsh
-```
-
-### Cách 2: Cài lệnh `kgsh` toàn cục qua `pip` / `uv`
+### 2. Cài CLI + mở ngay Rust TUI (`pip` / `uv`)
 
 ```powershell
 pip install kaggle-shell-mcp
-# hoặc cài độc lập qua uv:
-uv tool install kaggle-shell-mcp
+# hoặc: uv tool install kaggle-shell-mcp
 ```
 
-Công cụ tự động đọc thông tin xác thực theo thứ tự:
-1. Biến môi trường `KAGGLE_USERNAME` + `KAGGLE_KEY`,
-2. File `.env` ở thư mục hiện tại hoặc `~/.kaggle_mcp/.env`,
-3. File chuẩn `~/.kaggle/kaggle.json` nếu máy đã đăng nhập Kaggle trước đó.
+Điền `KAGGLE_USERNAME` và `KAGGLE_KEY` vào `.env` hoặc dùng sẵn `~/.kaggle/kaggle.json`, sau đó chạy:
 
----
-
-## Danh sách 12 MCP Tools cho AI Agent
-
-| MCP Tool | Chức năng |
-| :--- | :--- |
-| `kaggle_up` | Khởi chạy 1 hoặc 2 máy GPU chạy nền song song (`slot="1"`, `"2"`, hoặc `"1,2"`, chọn `accelerator`, `competition`, `mount_models`) |
-| `kaggle_status` | Xem trạng thái kernel, % GPU/VRAM, RAM, ổ đĩa trên tất cả các slot (`slot="all"`) và tự dọn phiên cũ đã hủy |
-| `kaggle_down` | Tắt sạch 1 slot hoặc toàn bộ (`slot="all"`) ngay lập tức để tiết kiệm giờ GPU; tuỳ chọn kéo `/kaggle/working` |
-| `term_exec` | Chạy lệnh bash tương tác trong PTY giữ trạng thái (`cd`, biến môi trường, `venv`) theo từng `slot` |
-| `job_spawn` | Chạy ngầm tác vụ train dài hạn (rớt mạng không chết), hỗ trợ ghim card lẻ `gpu_ids="0"` hoặc `"1"` |
-| `job_list` | Liệt kê danh sách tiến trình chạy ngầm trên `slot` |
-| `job_logs` | Đọc log tiến trình ngầm (đã tự gọt sạch thanh tiến trình `tqdm` `\r`) |
-| `job_kill` | Gửi `SIGTERM` / `SIGKILL` dừng tiến trình ngầm và giải phóng VRAM |
-| `fs_sync` | Đồng bộ nhanh thư mục code (`push`) hoặc kéo checkpoint/log (`pull`) theo `slot` |
-| `kaggle_wheelhouse` | Tải bộ `.whl` chuẩn Linux `manylinux_x86_64` đẩy lên Private Dataset để cài khi tắt mạng |
-| `kaggle_batch_run` | Đóng gói code chạy giải đấu khóa mạng (`enable_internet=False`) trên `L4x4` / `RTX Pro 6000` / `TPU` |
-| `kaggle_batch_logs` | Đọc live log thời gian thực từ tầng Host SSE của Kaggle kể cả khi container tắt sạch internet |
-
----
-
-## Ví dụ sử dụng qua CLI (`kgsh`)
-
-### 1. Bật song song 2 máy GPU & chia 4 job trên 4 card T4
 ```powershell
-# Bật cùng lúc 2 máy T4x2 (~60–95s)
-kgsh up -s 1,2
+# Mở màn hình TUI Rust 60-FPS (lần đầu sẽ tự tải binary kgsh-tui dựng sẵn từ GitHub Release + kiểm tra SHA-256)
+kgsh ui
 
-# Đẩy code lên cả 2 máy
+# Hoặc thao tác trực tiếp bằng CLI:
+kgsh quota
+kgsh up -s 1
+kgsh shell -s 1
+```
+
+### 3. Build từ mã nguồn GitHub (Dành cho developer)
+
+```powershell
+git clone https://github.com/NguyenQuocDat06-AI/kaggle-shell-mcp.git
+cd kaggle-shell-mcp
+python -m venv .venv
+.\.venv\Scripts\pip install -e ".[dev]"
+cargo build --release --manifest-path tui/Cargo.toml
+.\.venv\Scripts\kgsh ui
+```
+
+---
+
+## Phím tắt cốt lõi trong `kgsh ui`
+
+| Ngữ cảnh | Phím / Chuột | Chức năng |
+| :--- | :--- | :--- |
+| **Toàn cục** | `F1` / `F2` / `F3` / `F4` | Chuyển nhanh Preset: `Cockpit` · `Dual Files` · `Jobs & GPU` · `Kaggle Hub` |
+| | `Tab` / `Alt+←` `Alt+→` | Đổi focus panel `TRÁI <-> PHẢI` |
+| | `Ctrl+W` / `F5` / `Ctrl+K` / `?` | Quản lý Slot & Quota / Boot Profiles / Command Palette / Trợ giúp |
+| | `z` / `m` / `a` / `T` | Phóng to 100% panel / Đổi nội dung panel / Menu ngữ cảnh / Ẩn-hiện Telemetry |
+| | `F8` | Bật/tắt chế độ chuột TUI để bôi đen native của Windows Terminal |
+| **Chọn & Copy** | `Shift` / `Ctrl+Shift` + `↑↓←→` | Bôi chọn văn bản sạch trong `FileEditor`, `Shell`, `Logs`, `PreviewDrawer` & ô nhập |
+| | Kéo chuột trái | Bôi và tự copy nội dung sạch (tự cắt viền `│` và số dòng) |
+| **Shell (`F1`)** | `i` / `Enter` · `:run <lệnh>` · `Alt+Enter` | Vào chế độ gõ lệnh · Chạy vòng lặp `for`/train stream output trực tiếp |
+| **Files (`F2`)** | `←` / `→` · `Enter` · `v` | Lên thư mục cha (nhớ con trỏ) / Vào thư mục hoặc Preview (2× mở Editor) / Drawer |
+| | `Space` / `Shift+A` / `t` / `c` `x` `p` | Đánh dấu / Chọn hết / Đẩy-kéo qua panel đối diện / Clipboard chéo |
+| | `n` / `N` / `R` / `d` / `/` / `u` / `Shift+X` | Tạo file / Tạo thư mục / Đổi tên / Xóa (2×) / Tìm kiếm / `DU%` / Chạy script xem Live Logs |
+
+---
+
+## Quy trình mẫu 2 máy GPU & Competition khóa mạng
+
+```powershell
+# 1. Chạy song song 2 máy T4x2 (4 GPU = 60 GB VRAM) và chia 4 experiment
+kgsh up -s 1,2
 kgsh push .\my_app /kaggle/working -s 1
 kgsh push .\my_app /kaggle/working -s 2
-
-# Chạy 4 cấu hình thí nghiệm độc lập trên 4 card GPU
 kgsh spawn -s 1 --gpus 0 "python my_app/train.py --seed 1" --name s1g0
 kgsh spawn -s 1 --gpus 1 "python my_app/train.py --seed 2" --name s1g1
-kgsh spawn -s 2 --gpus 0 "python my_app/train.py --seed 3" --name s2g0
-kgsh spawn -s 2 --gpus 1 "python my_app/train.py --seed 4" --name s2g1
-
-# Kiểm tra tất cả slot & tắt toàn bộ khi xong việc
-kgsh status
 kgsh down -s all
-```
 
-### 2. Đẩy chạy Competition khóa mạng (`L4x4` / `RTX Pro 6000`)
-```powershell
-# Tải sẵn thư viện Linux đẩy lên Private Dataset (chỉ cần làm 1 lần)
+# 2. Đẩy chạy Competition khóa mạng (L4x4 / RTX Pro 6000) & đọc live log qua Host SSE
 kgsh wheels peft bitsandbytes --slug lora --py 312
-
-# Đẩy job offline trên phần cứng cuộc thi
 kgsh batch-run "torchrun --nproc_per_node=4 train.py" --path .\solution -a rtx6000 --comp ten-cuoc-thi --wheels ten_ban/kgsh-wheels-lora
-
-# Đọc live log trực tiếp không cần mở trình duyệt
 kgsh batch-logs -s batch-1 --tail 80
 ```

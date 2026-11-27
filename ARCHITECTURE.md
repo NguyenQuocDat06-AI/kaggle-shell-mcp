@@ -27,7 +27,7 @@ Kaggle's official `kernels_push` API executes non-interactive batch runs inside 
 flowchart TB
     subgraph Client["Local Host"]
         Agent["MCP Client (Claude / Cursor / Antigravity) or CLI (kgsh)"]
-        Server["server.py — 12 MCP Tools & CLI Router\n(stdout-protected JSON-RPC)"]
+        Server["server.py — 13 MCP Tools & CLI Router\n(stdout-protected JSON-RPC)"]
         Store[".kaggle_mcp/sessions.json\n(RLock + OS File Lock: msvcrt / fcntl)"]
     end
 
@@ -124,13 +124,30 @@ kaggle-shell-mcp/
 ├── src/kaggle_mcp/
 │   ├── __init__.py                    # Version & package metadata
 │   ├── accelerators.py                # Hardware alias resolver (T4, L4x4, RTX Pro 6000, H100, TPU, CPU) & caps
-│   ├── config.py                      # .env loader, KGAT_ token setup, file-locked multi-slot sessions.json
-│   ├── launcher.py                    # Multi-slot live bootstrap builder, source validator & parallel launcher
-│   ├── client.py                      # Slotted HTTPS RPC client with auto-healing tunnel refresh
+│   ├── activity.py                    # Local ~/.kaggle_mcp/activity.jsonl lifecycle stream for TUI visibility
 │   ├── batch.py                       # Offline wheelhouse builder, batch runner & bounded Host SSE log reader
+│   ├── bridge.py                      # JSON stdin/stdout bridge for Rust TUI -> Kaggle SDK & launcher calls
+│   ├── client.py                      # Slotted HTTPS RPC client (/monitor, chunked logs, /fs/* & tunnel auto-heal)
+│   ├── config.py                      # .env / kaggle.json loader & file-locked multi-slot sessions.json
+│   ├── kaggle_hub.py                  # Kaggle Hub search, inspector, kernel logs/delete & CSV submission helpers
+│   ├── launcher.py                    # Multi-slot live bootstrap builder, source validator & parallel launcher
+│   ├── profiles.py                    # Atomic boot profile store (~/.kaggle_mcp/profiles.json)
+│   ├── quota.py                       # Weekly GPU/TPU quota reader via native kagglesdk timedelta objects
+│   ├── repl.py                        # Interactive SSH-style bash REPL (kgsh shell) & tail -f log follower
+│   ├── server.py                      # 13 MCP tools + standalone kgsh CLI router
 │   ├── sync.py                        # Filtered .tar.gz packer/unpacker with path-traversal guards
-│   ├── server.py                      # 12 MCP tools + standalone kgsh CLI parser
+│   ├── tui_bin.py                     # Prebuilt kgsh-tui locator & GitHub Release SHA-256 auto-downloader
 │   └── remote/
-│       └── worker_template.py         # Zero-dep stdlib remote daemon (PTY, JobManager, tunnels & watchdogs)
-└── tests/                             # Offline pytest suite (accelerators, multi-slot locking, SSE, sync, stdio)
+│       └── worker_template.py         # Zero-dep stdlib remote daemon (PTY, JobManager, EventBus, /fs/* & /monitor)
+├── tui/                               # Native Rust 60-FPS Dual-Panel TUI Cockpit (kgsh-tui)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                    # Event loop, adaptive polling, mouse capture & terminal restore guard
+│       ├── app/                       # State, async dispatch, keyboard/mouse input, selection & unit tests
+│       ├── ui/                        # Graphite minimalist dual-panel rendering, panes & modals
+│       ├── worker.rs                  # Async reqwest HTTP client for slotted worker & /fs/* RPCs
+│       ├── bridge.rs                  # Async tokio stdin/stdout caller for kaggle_mcp.bridge
+│       ├── state.rs                   # Shared sessions.json / profiles.json / activity bus readers
+│       └── file_icons.rs              # Graphite palette constants, single-width badges & line highlighting
+└── tests/                             # Offline pytest suite (accelerators, bridge, multi-slot locking, SSE, sync, stdio)
 ```

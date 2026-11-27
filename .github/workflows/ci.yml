@@ -33,3 +33,24 @@ jobs:
 
       - name: Run Pytest suite
         run: pytest -v
+
+  rust-tui:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy check (`tui`)
+        run: cargo clippy --manifest-path tui/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run Rust TUI tests
+        run: cargo test --manifest-path tui/Cargo.toml

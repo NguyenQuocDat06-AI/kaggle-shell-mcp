@@ -1,9 +1,12 @@
 .env
 .venv/
 .kaggle_mcp/
+kaggle_downloads/
+kaggle_pull/
 ROADMAP.md
 __pycache__/
 *.py[cod]
 build/
 dist/
 *.egg-info/
+tui/target/

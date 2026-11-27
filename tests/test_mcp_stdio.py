@@ -9,6 +9,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 EXPECTED_TOOLS = {
+    "kaggle_quota",
     "kaggle_up",
     "kaggle_status",
     "kaggle_down",
@@ -25,7 +26,7 @@ EXPECTED_TOOLS = {
 
 
 @pytest.mark.asyncio
-async def test_mcp_stdio_registers_all_twelve_tools() -> None:
+async def test_mcp_stdio_registers_all_thirteen_tools() -> None:
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "kaggle_mcp.server"],

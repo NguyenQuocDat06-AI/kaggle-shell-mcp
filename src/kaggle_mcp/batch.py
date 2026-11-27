@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .accelerators import resolve_accelerator
+from .activity import record_local_activity
 from .config import (
     STATE_DIR,
     ActiveSession,
@@ -252,6 +253,12 @@ def build_wheelhouse(
         api = get_kaggle_api(settings)
         created = _upsert_private_dataset(api, ds_ref, tmp_p, notes=f"wheels:{','.join(pkg_list)[:60]}")
 
+    record_local_activity(
+        "all",
+        "mcp",
+        "wheelhouse",
+        f"Built {len(wheels)} Linux wheels -> {ds_ref} ({total_mb} MB)",
+    )
     return {
         "dataset_ref": ds_ref,
         "created_new": created,
@@ -382,6 +389,13 @@ def submit_offline_batch(
         enable_internet=bool(enable_internet),
     )
     save_active_session(sess, slot=s)
+    record_local_activity(
+        s,
+        "mcp",
+        "batch_run",
+        f"Submitted batch ({acc_spec.label}, internet={bool(enable_internet)}) -> {kernel_ref}",
+        detail=command,
+    )
 
     return {
         "slot": s,

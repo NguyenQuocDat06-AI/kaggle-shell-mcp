@@ -13,9 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from .accelerators import resolve_accelerator
+from .activity import record_local_activity
 from .config import (
     STATE_DIR,
     ActiveSession,
@@ -166,12 +165,15 @@ def probe_worker_ping(base_url: str, expected_session_id: str = "") -> dict[str,
     if not base_url:
         return None
     try:
-        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
-            r = client.get(f"{base_url.rstrip('/')}/ping")
-            if r.status_code == 200:
-                data = r.json()
-                if not expected_session_id or data.get("session_id") == expected_session_id:
-                    return data
+        from .client import _get_pooled_client
+
+        clean_base = base_url.rstrip("/")
+        client = _get_pooled_client(clean_base)
+        r = client.get(f"{clean_base}/ping", timeout=6.0)
+        if r.status_code == 200:
+            data = r.json()
+            if not expected_session_id or data.get("session_id") == expected_session_id:
+                return data
     except Exception:
         return None
     return None
@@ -304,6 +306,12 @@ def launch_worker(
         mount_models=mount_models,
     )
 
+    record_local_activity(
+        s,
+        "mcp",
+        "boot_start",
+        f"Provisioning slot '{s}' ({acc_spec.label}) -> {kernel_ref}",
+    )
     with protect_stdout():
         push_resp = api.kernels_push(
             str(bundle_dir),
@@ -320,6 +328,13 @@ def launch_worker(
         last_kstatus = kinfo["status"]
 
         if last_kstatus in {"ERROR", "CANCELLED", "CANCEL_ACKNOWLEDGED"}:
+            record_local_activity(
+                s,
+                "mcp",
+                "boot_error",
+                f"Kernel {kernel_ref} entered {last_kstatus}",
+                detail=kinfo.get("failure_message", ""),
+            )
             raise RuntimeError(
                 f"Kaggle kernel ({kernel_ref}) entered {last_kstatus}: "
                 f"{kinfo.get('failure_message') or 'check Kaggle logs (note: some competition GPUs force enable_internet=false; use kaggle_batch_run for offline GPUs)'}"
@@ -353,6 +368,13 @@ def launch_worker(
                     enable_internet=True,
                 )
                 save_active_session(active, slot=s)
+                record_local_activity(
+                    s,
+                    "mcp",
+                    "boot_ready",
+                    f"Slot '{s}' LIVE ({acc_spec.label})",
+                    detail=active.base_url,
+                )
                 return {
                     "slot": s,
                     "reused_existing": False,

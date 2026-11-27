@@ -1,10 +1,11 @@
-"""kaggle-shell-mcp (`kgsh`) Server & CLI entrypoint exposing 12 multi-slot & competition GPU tools."""
+"""kaggle-shell-mcp (`kgsh`) Server & CLI entrypoint exposing 13 MCP tools + TUI Cockpit & REPL."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,6 +17,7 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP as _MCPServerClass  # type: ignore[no-redef]
 
 from . import __version__
+from .activity import mcp_call_span, record_local_activity
 from .batch import build_wheelhouse, read_batch_logs_windowed, submit_offline_batch
 from .client import WorkerClient
 from .config import (
@@ -33,6 +35,7 @@ from .launcher import (
     launch_workers_multi,
     pull_kernel_outputs,
 )
+from .quota import fetch_quota_summary
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -41,6 +44,7 @@ mcp = _MCPServerClass(
     instructions=(
         "Control up to 2 concurrent headless Kaggle GPU sessions (`slot='1'`, `slot='2'`) or offline "
         "Competition GPUs (`NvidiaL4x4`, `NvidiaRtxPro6000`). "
+        "Check weekly GPU/TPU allowance first via `kaggle_quota`. "
         "Use `kaggle_up` + `term_exec` / `job_spawn` / `fs_sync` for interactive GPU sessions with internet; "
         "use `kaggle_wheelhouse` + `kaggle_batch_run` + `kaggle_batch_logs` when competition hardware forces "
         "`enable_internet=False`. Call `kaggle_down` when finished to preserve weekly GPU quota."
@@ -50,6 +54,14 @@ mcp = _MCPServerClass(
 
 def _fmt(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def kaggle_quota() -> str:
+    """Check remaining weekly Kaggle GPU & TPU quota hours, usage percentage, and reset timestamp."""
+    with mcp_call_span("kaggle_quota", slot="all", summary="weekly GPU/TPU quota"):
+        settings = load_settings()
+        return _fmt(fetch_quota_summary(settings))
 
 
 @mcp.tool()
@@ -72,21 +84,22 @@ def kaggle_up(
     - `competition`: competition slug to attach (`competition_sources`). Note: if the competition forces internet OFF, use `kaggle_batch_run` instead.
     - `mount_datasets` / `mount_models`: attach Kaggle Datasets or Kaggle Hub Models at `/kaggle/input`.
     """
-    settings = load_settings()
-    slots = [s.strip() for s in slot.split(",") if s.strip()] or ["1"]
-    res = launch_workers_multi(
-        settings=settings,
-        slots=slots,
-        gpu=gpu,
-        accelerator=accelerator,
-        idle_timeout_min=idle_timeout_min,
-        competition=competition or None,
-        mount_datasets=mount_datasets,
-        mount_models=mount_models,
-        chain_previous_output=chain_previous_output,
-        wait_ready_sec=wait_ready_sec,
-    )
-    return _fmt(res)
+    with mcp_call_span("kaggle_up", slot=slot, summary=f"acc={accelerator} slot={slot}"):
+        settings = load_settings()
+        slots = [s.strip() for s in slot.split(",") if s.strip()] or ["1"]
+        res = launch_workers_multi(
+            settings=settings,
+            slots=slots,
+            gpu=gpu,
+            accelerator=accelerator,
+            idle_timeout_min=idle_timeout_min,
+            competition=competition or None,
+            mount_datasets=mount_datasets,
+            mount_models=mount_models,
+            chain_previous_output=chain_previous_output,
+            wait_ready_sec=wait_ready_sec,
+        )
+        return _fmt(res)
 
 
 def _inspect_one_slot(settings: Any, api: Any, slot_name: str) -> dict[str, Any]:
@@ -113,7 +126,7 @@ def _inspect_one_slot(settings: Any, api: Any, slot_name: str) -> dict[str, Any]
             entry["cleaned_stale_session"] = True
         elif kinfo["status"] == "RUNNING":
             try:
-                entry["worker_live"] = WorkerClient(settings, slot=s).status()
+                entry["worker_live"] = WorkerClient(settings, slot=s, caller="mcp").status()
                 return entry
             except Exception as exc:
                 entry["worker_connect_note"] = str(exc)
@@ -133,47 +146,55 @@ def kaggle_status(slot: str = "all") -> str:
     - `slot='all'` (default): inspects all active/registered slots (or slot `'1'` if none registered).
     - `slot='1'` or `slot='2'`: inspects a specific worker slot.
     """
-    settings = load_settings()
-    api = get_kaggle_api(settings)
-    raw = (slot or "all").strip().lower()
+    with mcp_call_span("kaggle_status", slot=slot, summary=f"slot={slot}"):
+        settings = load_settings()
+        api = get_kaggle_api(settings)
+        raw = (slot or "all").strip().lower()
 
-    if raw != "all":
-        return _fmt(_inspect_one_slot(settings, api, raw))
+        if raw != "all":
+            return _fmt(_inspect_one_slot(settings, api, raw))
 
-    all_sessions = load_all_sessions()
-    target_slots = sorted(all_sessions.keys()) if all_sessions else ["1"]
-    if len(target_slots) == 1:
-        return _fmt(_inspect_one_slot(settings, api, target_slots[0]))
+        all_sessions = load_all_sessions()
+        target_slots = sorted(all_sessions.keys()) if all_sessions else ["1"]
+        if len(target_slots) == 1:
+            return _fmt(_inspect_one_slot(settings, api, target_slots[0]))
 
-    slots_report = {s: _inspect_one_slot(settings, api, s) for s in target_slots}
-    running_gpu_slots = [
-        s
-        for s, info in slots_report.items()
-        if info.get("kaggle_api_status") in {"RUNNING", "QUEUED"} and info.get("accelerator") != "CPU"
-    ]
-    return _fmt(
-        {
-            "active_gpu_slots_count": len(running_gpu_slots),
-            "active_gpu_slots": running_gpu_slots,
-            "slots": slots_report,
-        }
-    )
+        slots_report = {s: _inspect_one_slot(settings, api, s) for s in target_slots}
+        running_gpu_slots = [
+            s
+            for s, info in slots_report.items()
+            if info.get("kaggle_api_status") in {"RUNNING", "QUEUED"} and info.get("accelerator") != "CPU"
+        ]
+        return _fmt(
+            {
+                "active_gpu_slots_count": len(running_gpu_slots),
+                "active_gpu_slots": running_gpu_slots,
+                "slots": slots_report,
+            }
+        )
 
 
-def _shutdown_one_slot(settings: Any, s: str, pull_outputs: bool, local_output_dir: str) -> dict[str, Any]:
+def _shutdown_one_slot(
+    settings: Any,
+    s: str,
+    pull_outputs: bool,
+    local_output_dir: str,
+    caller: str = "mcp",
+) -> dict[str, Any]:
     out: dict[str, Any] = {"slot": s, "shutdown_sent": False}
     sess = load_active_session(s)
     kref = sess.kernel_ref if (sess and sess.kernel_ref) else ""
 
     if not sess or sess.mode == "live":
         try:
-            client = WorkerClient(settings, slot=s)
+            client = WorkerClient(settings, slot=s, caller=caller)
             out["worker_response"] = client.shutdown()
             out["shutdown_sent"] = True
         except Exception as exc:
             out["shutdown_note"] = str(exc)
 
     clear_active_session(s)
+    record_local_activity(s, caller, "shutdown", f"Shut down slot '{s}'")
 
     if pull_outputs:
         dest = Path(local_output_dir) / f"slot_{s}" if local_output_dir else Path(f"./kaggle_outputs/slot_{s}")
@@ -188,22 +209,23 @@ def kaggle_down(
     local_output_dir: str = "./kaggle_outputs",
 ) -> str:
     """Gracefully stop a remote Kaggle worker (`exit 0`) to save GPU quota; pass `slot='all'` to stop all slots."""
-    settings = load_settings()
-    raw = (slot or "1").strip().lower()
+    with mcp_call_span("kaggle_down", slot=slot, summary=f"slot={slot} pull={pull_outputs}"):
+        settings = load_settings()
+        raw = (slot or "1").strip().lower()
 
-    if raw == "all":
-        slots = sorted(load_all_sessions().keys()) or ["1"]
-        with ThreadPoolExecutor(max_workers=min(4, len(slots))) as pool:
-            results = list(
-                pool.map(lambda s: _shutdown_one_slot(settings, s, pull_outputs, local_output_dir), slots)
-            )
-        return _fmt({"stopped_slots": results})
+        if raw == "all":
+            slots = sorted(load_all_sessions().keys()) or ["1"]
+            with ThreadPoolExecutor(max_workers=min(4, len(slots))) as pool:
+                results = list(
+                    pool.map(lambda s: _shutdown_one_slot(settings, s, pull_outputs, local_output_dir), slots)
+                )
+            return _fmt({"stopped_slots": results})
 
-    s = normalize_slot(raw)
-    out = _shutdown_one_slot(settings, s, pull_outputs=False, local_output_dir=local_output_dir)
-    if pull_outputs:
-        out["pulled_files"] = pull_kernel_outputs(settings, Path(local_output_dir), slot=s)
-    return _fmt(out)
+        s = normalize_slot(raw)
+        out = _shutdown_one_slot(settings, s, pull_outputs=False, local_output_dir=local_output_dir)
+        if pull_outputs:
+            out["pulled_files"] = pull_kernel_outputs(settings, Path(local_output_dir), slot=s)
+        return _fmt(out)
 
 
 @mcp.tool()
@@ -214,14 +236,15 @@ def term_exec(
     slot: str = "1",
 ) -> str:
     """Execute a bash command inside a persistent stateful PTY on Kaggle `slot` (preserves `cwd`, env, CUDA, venv)."""
-    settings = load_settings()
-    res = WorkerClient(settings, slot=slot).term_exec(
-        command=command,
-        session=session,
-        timeout_sec=float(timeout_sec),
-    )
-    res["slot"] = normalize_slot(slot)
-    return _fmt(res)
+    with mcp_call_span("term_exec", slot=slot, summary=command):
+        settings = load_settings()
+        res = WorkerClient(settings, slot=slot, caller="mcp").term_exec(
+            command=command,
+            session=session,
+            timeout_sec=float(timeout_sec),
+        )
+        res["slot"] = normalize_slot(slot)
+        return _fmt(res)
 
 
 @mcp.tool()
@@ -237,24 +260,26 @@ def job_spawn(
     - `gpu_ids`: optional `CUDA_VISIBLE_DEVICES` pin (e.g. `'0'` or `'1'`) to run 2 separate GPU jobs per Dual-T4 VM!
     - `slot`: target worker VM (`'1'` or `'2'`). Combine 2 slots x 2 GPUs to run up to 4 parallel single-GPU jobs.
     """
-    settings = load_settings()
-    res = WorkerClient(settings, slot=slot).job_spawn(
-        command=command,
-        cwd=cwd,
-        name=name,
-        gpu_ids=gpu_ids,
-    )
-    res["slot"] = normalize_slot(slot)
-    return _fmt(res)
+    with mcp_call_span("job_spawn", slot=slot, summary=f"{name or 'job'}: {command}"):
+        settings = load_settings()
+        res = WorkerClient(settings, slot=slot, caller="mcp").job_spawn(
+            command=command,
+            cwd=cwd,
+            name=name,
+            gpu_ids=gpu_ids,
+        )
+        res["slot"] = normalize_slot(slot)
+        return _fmt(res)
 
 
 @mcp.tool()
 def job_list(slot: str = "1") -> str:
     """List all running and finished background jobs on worker `slot`."""
-    settings = load_settings()
-    res = WorkerClient(settings, slot=slot).job_list()
-    res["slot"] = normalize_slot(slot)
-    return _fmt(res)
+    with mcp_call_span("job_list", slot=slot, summary=f"slot={slot}"):
+        settings = load_settings()
+        res = WorkerClient(settings, slot=slot, caller="mcp").job_list()
+        res["slot"] = normalize_slot(slot)
+        return _fmt(res)
 
 
 @mcp.tool()
@@ -265,19 +290,25 @@ def job_logs(
     slot: str = "1",
 ) -> str:
     """Read tail lines of a background job log on `slot` with automatic `tqdm` (`\\r`) compaction."""
-    settings = load_settings()
-    res = WorkerClient(settings, slot=slot).job_logs(job_id=job_id, tail_lines=tail_lines, grep=grep)
-    res["slot"] = normalize_slot(slot)
-    return _fmt(res)
+    with mcp_call_span("job_logs", slot=slot, summary=f"{job_id} (tail={tail_lines})"):
+        settings = load_settings()
+        res = WorkerClient(settings, slot=slot, caller="mcp").job_logs(
+            job_id=job_id,
+            tail_lines=tail_lines,
+            grep=grep,
+        )
+        res["slot"] = normalize_slot(slot)
+        return _fmt(res)
 
 
 @mcp.tool()
 def job_kill(job_id: str, signal: str = "SIGTERM", slot: str = "1") -> str:
     """Send `SIGTERM` or `SIGKILL` to a background job's process group on `slot` and release VRAM."""
-    settings = load_settings()
-    res = WorkerClient(settings, slot=slot).job_kill(job_id=job_id, sig=signal)
-    res["slot"] = normalize_slot(slot)
-    return _fmt(res)
+    with mcp_call_span("job_kill", slot=slot, summary=f"{job_id} ({signal})"):
+        settings = load_settings()
+        res = WorkerClient(settings, slot=slot, caller="mcp").job_kill(job_id=job_id, sig=signal)
+        res["slot"] = normalize_slot(slot)
+        return _fmt(res)
 
 
 @mcp.tool()
@@ -288,14 +319,15 @@ def fs_sync(
     slot: str = "1",
 ) -> str:
     """Synchronize files or directories between local machine and Kaggle worker `slot` (`push` or `pull`)."""
-    settings = load_settings()
-    client = WorkerClient(settings, slot=slot)
-    mode = direction.strip().lower()
-    if mode == "push":
-        return _fmt(client.fs_push(local_path=local_path, remote_path=remote_path))
-    if mode == "pull":
-        return _fmt(client.fs_pull(remote_path=remote_path, local_path=local_path))
-    raise ValueError("`direction` must be 'push' or 'pull'.")
+    with mcp_call_span("fs_sync", slot=slot, summary=f"{direction}: {local_path} <-> {remote_path}"):
+        settings = load_settings()
+        client = WorkerClient(settings, slot=slot, caller="mcp")
+        mode = direction.strip().lower()
+        if mode == "push":
+            return _fmt(client.fs_push(local_path=local_path, remote_path=remote_path))
+        if mode == "pull":
+            return _fmt(client.fs_pull(remote_path=remote_path, local_path=local_path))
+        raise ValueError("`direction` must be 'push' or 'pull'.")
 
 
 @mcp.tool()
@@ -305,9 +337,10 @@ def kaggle_wheelhouse(
     python_version: str = "312",
 ) -> str:
     """Download Linux x86_64 binary `.whl` packages and publish them as a private Kaggle Dataset for offline runs."""
-    settings = load_settings()
-    res = build_wheelhouse(settings=settings, packages=packages, slug=slug, python_version=python_version)
-    return _fmt(res)
+    with mcp_call_span("kaggle_wheelhouse", slot="all", summary=f"{slug}: {','.join(packages[:4])}"):
+        settings = load_settings()
+        res = build_wheelhouse(settings=settings, packages=packages, slug=slug, python_version=python_version)
+        return _fmt(res)
 
 
 @mcp.tool()
@@ -327,20 +360,21 @@ def kaggle_batch_run(
     Automatically bundles `local_path` into a private code Dataset, installs offline wheels from `wheel_datasets`,
     executes `command` even when `enable_internet=False`, and streams logs via `kaggle_batch_logs`.
     """
-    settings = load_settings()
-    res = submit_offline_batch(
-        settings=settings,
-        command=command,
-        local_path=local_path,
-        slot=slot,
-        accelerator=accelerator,
-        competition=competition or None,
-        enable_internet=enable_internet,
-        wheel_datasets=wheel_datasets,
-        mount_datasets=mount_datasets,
-        mount_models=mount_models,
-    )
-    return _fmt(res)
+    with mcp_call_span("kaggle_batch_run", slot=slot, summary=f"{accelerator}: {command}"):
+        settings = load_settings()
+        res = submit_offline_batch(
+            settings=settings,
+            command=command,
+            local_path=local_path,
+            slot=slot,
+            accelerator=accelerator,
+            competition=competition or None,
+            enable_internet=enable_internet,
+            wheel_datasets=wheel_datasets,
+            mount_datasets=mount_datasets,
+            mount_models=mount_models,
+        )
+        return _fmt(res)
 
 
 @mcp.tool()
@@ -352,27 +386,40 @@ def kaggle_batch_logs(
     wait_sec: int = 5,
 ) -> str:
     """Stream live or completed logs from a Kaggle batch/competition kernel via Host SSE (works even with internet OFF)."""
-    settings = load_settings()
-    res = read_batch_logs_windowed(
-        settings=settings,
-        slot=slot,
-        kernel_ref=kernel_ref,
-        tail_lines=tail_lines,
-        grep=grep,
-        wait_sec=float(wait_sec),
-    )
-    return _fmt(res)
+    with mcp_call_span("kaggle_batch_logs", slot=slot, summary=f"slot={slot} tail={tail_lines}"):
+        settings = load_settings()
+        res = read_batch_logs_windowed(
+            settings=settings,
+            slot=slot,
+            kernel_ref=kernel_ref,
+            tail_lines=tail_lines,
+            grep=grep,
+            wait_sec=float(wait_sec),
+        )
+        return _fmt(res)
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kgsh",
-        description="kgsh (kaggle-shell-mcp) — Multi-Slot Kaggle GPU Shell & Offline Competition Runner",
+        description="kgsh (kaggle-shell-mcp) — Multi-Slot Kaggle GPU TUI Cockpit, Shell & MCP Server",
     )
     parser.add_argument("--version", action="version", version=f"kgsh {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("mcp", help="Run stdio MCP server explicitly")
+
+    for ui_alias in ("ui", "top"):
+        p_ui = sub.add_parser(ui_alias, help="Open native 60-FPS Rust TUI Cockpit (kgsh-tui)")
+        p_ui.add_argument("-s", "--slot", default="1", help="Initial slot to focus (default: 1)")
+
+    p_sh = sub.add_parser("shell", help="Attach interactive SSH-style bash REPL sharing state with MCP Agent")
+    p_sh.add_argument("-s", "--slot", default="1", help="Target worker slot (default: 1)")
+    p_sh.add_argument("--session", default="default", help="PTY session name")
+    p_sh.add_argument("--timeout", type=int, default=300, help="Per-command timeout seconds")
+
+    p_qt = sub.add_parser("quota", help="Display remaining weekly Kaggle GPU & TPU quota")
+    p_qt.add_argument("--json", action="store_true", help="Output raw JSON instead of table")
 
     p_up = sub.add_parser("up", help="Boot 1 or 2 headless Kaggle GPU workers")
     p_up.add_argument("-s", "--slot", default="1", help="Slot ID ('1', '2', or '1,2' for dual parallel VMs)")
@@ -398,6 +445,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("-s", "--slot", default="1", help="Target worker slot")
     p_exec.add_argument("--session", default="default", help="PTY session name")
     p_exec.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
+    p_exec.add_argument("-r", "--raw", action="store_true", help="Print plain output instead of JSON")
 
     p_spawn = sub.add_parser("spawn", help="Start detached background job")
     p_spawn.add_argument("command", help="Background command to run")
@@ -409,9 +457,10 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     p_jobs = sub.add_parser("jobs", help="List background jobs")
     p_jobs.add_argument("-s", "--slot", default="1", help="Target worker slot")
 
-    p_logs = sub.add_parser("logs", help="Tail logs of a background job")
+    p_logs = sub.add_parser("logs", help="Tail or follow (-f) logs of a background job")
     p_logs.add_argument("job_id", help="Job identifier")
     p_logs.add_argument("-s", "--slot", default="1", help="Target worker slot")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="Stream live logs continuously (tail -f)")
     p_logs.add_argument("--tail", type=int, default=100, help="Number of tail lines")
     p_logs.add_argument("--grep", default="", help="Optional regex filter")
 
@@ -462,6 +511,38 @@ def _run_cli(argv: list[str]) -> None:
 
     if args.cmd == "mcp":
         mcp.run(transport="stdio")
+    elif args.cmd in {"ui", "top"}:
+        from .tui_bin import ensure_tui_binary
+
+        try:
+            exe_path = ensure_tui_binary()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        rc = subprocess.run(
+            [str(exe_path), "--slot", normalize_slot(args.slot), "--python", sys.executable],
+            check=False,
+        ).returncode
+        sys.exit(rc)
+    elif args.cmd == "shell":
+        from .repl import run_interactive_shell
+
+        sys.exit(
+            run_interactive_shell(
+                settings=load_settings(),
+                slot=args.slot,
+                session=args.session,
+                timeout_sec=float(args.timeout),
+            )
+        )
+    elif args.cmd == "quota":
+        qdata = fetch_quota_summary(load_settings())
+        if args.json:
+            print(_fmt(qdata))
+        else:
+            from .repl import render_quota_table
+
+            render_quota_table(qdata)
     elif args.cmd == "up":
         acc = "cpu" if args.no_gpu else args.acc
         print(
@@ -482,12 +563,34 @@ def _run_cli(argv: list[str]) -> None:
     elif args.cmd == "down":
         print(kaggle_down(slot=args.slot, pull_outputs=args.pull, local_output_dir=args.out))
     elif args.cmd == "exec":
-        print(term_exec(command=args.command, session=args.session, timeout_sec=args.timeout, slot=args.slot))
+        res = WorkerClient(load_settings(), slot=args.slot, caller="cli").term_exec(
+            command=args.command,
+            session=args.session,
+            timeout_sec=float(args.timeout),
+        )
+        res["slot"] = normalize_slot(args.slot)
+        if args.raw:
+            out = res.get("output") or ""
+            if out:
+                print(out)
+            sys.exit(int(res.get("exit_code") or 0))
+        print(_fmt(res))
     elif args.cmd == "spawn":
-        print(job_spawn(command=args.command, cwd=args.cwd, name=args.name, gpu_ids=args.gpus, slot=args.slot))
+        res = WorkerClient(load_settings(), slot=args.slot, caller="cli").job_spawn(
+            command=args.command,
+            cwd=args.cwd,
+            name=args.name,
+            gpu_ids=args.gpus,
+        )
+        res["slot"] = normalize_slot(args.slot)
+        print(_fmt(res))
     elif args.cmd == "jobs":
         print(job_list(slot=args.slot))
     elif args.cmd == "logs":
+        if args.follow:
+            from .repl import stream_job_logs
+
+            sys.exit(stream_job_logs(load_settings(), job_id=args.job_id, slot=args.slot))
         print(job_logs(job_id=args.job_id, tail_lines=args.tail, grep=args.grep, slot=args.slot))
     elif args.cmd == "kill":
         print(job_kill(job_id=args.job_id, signal=args.signal, slot=args.slot))

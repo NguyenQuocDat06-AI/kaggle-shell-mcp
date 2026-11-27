@@ -21,6 +21,11 @@ python -m venv .venv
 ```bash
 ruff check src tests
 pytest -v
+
+# Rust TUI (`tui/`)
+cargo clippy --manifest-path tui/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tui/Cargo.toml
+cargo build --release --manifest-path tui/Cargo.toml
 ```
 
 > Note: Unit and MCP protocol tests in `tests/` do **not** require live Kaggle GPU quota and run offline in seconds.

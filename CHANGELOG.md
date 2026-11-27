@@ -2,6 +2,25 @@
 
 All notable changes to **`kaggle-shell-mcp`** (`kgsh`) will be documented in this file.
 
+## [1.0.0] - 2026-11-27
+
+### Added
+- **Prebuilt Rust TUI Distribution & Auto-Downloader (`tui_bin.py`, `release-tui.yml`)**:
+  - `kgsh ui` automatically locates a local/PATH `kgsh-tui` executable or downloads the matching prebuilt Windows/Linux/macOS binary from GitHub Releases into `~/.kaggle_mcp/bin/` with `SHA256SUMS.txt` verification—zero Rust setup required for PyPI/`uv tool` users.
+- **Native Rust 60-FPS Dual-Panel TUI Cockpit (`tui/` -> `kgsh ui` / `kgsh top`)**:
+  - Replaced legacy Python Textual UI with a native `ratatui` + `tokio` + `reqwest` binary (`kgsh-tui`) featuring 4 instant dual-panel presets (`F1 Cockpit`, `F2 Files`, `F3 Jobs`, `F4 Hub`), `NAV`/`INPUT` modes, 100% pane zoom (`z`), collapsible telemetry, Yazi-style arrow file navigation, cross-panel clipboard/transfers, auto-follow preview drawer (`v`), live foreground PTY output tailing (`pty_live` on `/monitor` + `POST /term/interrupt`), clean content-only mouse/keyboard text selection (`Shift` / `Ctrl+Shift` + `↑`/`↓`/`←`/`→` + `F8` native select), and clickable navigation.
+- **File Operations, Smart Inspector, Kaggle Hub & Boot Profiles (`worker_template.py`, `client.py`, `kaggle_hub.py`, `profiles.py`, `bridge.py`)**:
+  - Added `/fs/list`, `/fs/read_text`, `/fs/write_text`, `/fs/mkdir`, `/fs/rename`, `/fs/copy`, `/fs/delete`, `/fs/du`, `/fs/find`, `/fs/inspect` (CSV/Parquet/Archive/Safetensors/PyTorch), `/fs/archive`, `/fs/extract`, `/fs/publish_dataset`, and `/proc/kill` with HTTP 404 PTY fallbacks on older workers.
+  - Added Kaggle Hub browser (`datasets`, `my_datasets`, `competitions`, `models`, `my_kernels` logs/delete, `submit_csv`), saved boot profiles (`~/.kaggle_mcp/profiles.json`), and UTF-8 JSON bridge (`kaggle_mcp.bridge`).
+- **Real-Time MCP Activity Bus & Combined `/monitor` RPC (`activity.py`, `worker_template.py`)**:
+  - Added in-worker `EventBus` ring buffer tagging caller origin (`X-Kgsh-Caller: mcp | tui | shell | cli`) plus local `~/.kaggle_mcp/activity.jsonl` and `mcp_flow.jsonl` streams so `kgsh ui` displays every MCP tool action in real time.
+  - Added single-roundtrip `POST /monitor` (with GPU/VRAM, RAM, disk, jobs, logs, events, and live PTY tail) and incremental byte-offset `POST /jobs/logs_chunk` endpoints (passive monitoring does not reset `idle_timeout_min`).
+- **Interactive SSH-Style REPL & Live Log Follower (`repl.py`)**:
+  - `kgsh shell [-s 1]`: Stateful remote bash REPL sharing `cwd` and environment variables with the MCP Agent.
+  - `kgsh logs <job_id> -f`: Continuous `tail -f` streaming until job completion, plus `kgsh exec -r/--raw`.
+- **Weekly Accelerator Quota Inspection (`kaggle_quota` MCP tool & `kgsh quota`, `quota.py`)**:
+  - Reads native `datetime.timedelta` attributes from `KernelsApiClient.get_accelerator_quota_statistics()` to report exact weekly GPU & TPU hours remaining and reset timestamps.
+
 ## [0.2.0] - 2026-11-25
 
 ### Added
