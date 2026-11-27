@@ -26,16 +26,23 @@ jobs:
             asset: kgsh-tui-windows-x86_64.zip
           - name: linux-x86_64
             os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
+            rust_target: x86_64-unknown-linux-musl
             bin_name: kgsh-tui
             asset: kgsh-tui-linux-x86_64.tar.gz
+            use_cross_toolchain: true
+          - name: linux-aarch64
+            os: ubuntu-latest
+            rust_target: aarch64-unknown-linux-musl
+            bin_name: kgsh-tui
+            asset: kgsh-tui-linux-aarch64.tar.gz
+            use_cross_toolchain: true
           - name: macos-arm64
-            os: macos-14
+            os: macos-latest
             rust_target: aarch64-apple-darwin
             bin_name: kgsh-tui
             asset: kgsh-tui-macos-arm64.tar.gz
           - name: macos-x86_64
-            os: macos-14
+            os: macos-latest
             rust_target: x86_64-apple-darwin
             bin_name: kgsh-tui
             asset: kgsh-tui-macos-x86_64.tar.gz
@@ -49,6 +56,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+
+      - name: Set up Linux musl cross toolchain (${{ matrix.rust_target }})
+        if: matrix.use_cross_toolchain == true
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.rust_target }}
 
       - name: Build release binary
         run: cargo build --release --manifest-path tui/Cargo.toml --target ${{ matrix.rust_target }}
