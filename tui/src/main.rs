@@ -10,7 +10,8 @@ mod worker;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -29,7 +30,7 @@ use crate::bridge::PythonBridge;
 use crate::state::resolve_state_dir;
 
 #[derive(Parser, Debug)]
-#[command(name = "kgsh-tui", version = "1.0.0", about = "Native Rust 60-FPS Dual-Panel TUI Cockpit for kaggle-shell-mcp")]
+#[command(name = "kgsh-tui", version = "1.0.1", about = "Native Rust 60-FPS Dual-Panel TUI Cockpit for kaggle-shell-mcp")]
 struct Cli {
     /// Initial worker slot to focus
     #[arg(short, long, default_value = "1")]
@@ -46,7 +47,12 @@ struct Cli {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
 }
 
 #[tokio::main]
@@ -63,7 +69,12 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -124,6 +135,10 @@ async fn main() -> Result<()> {
                                 let _ = execute!(stdout(), DisableMouseCapture);
                             }
                         }
+                        needs_redraw = true;
+                    }
+                    Event::Paste(pasted) => {
+                        app.handle_paste(pasted);
                         needs_redraw = true;
                     }
                     Event::Resize(_, _) => {

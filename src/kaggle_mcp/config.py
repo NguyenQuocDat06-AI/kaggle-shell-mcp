@@ -41,6 +41,40 @@ _SLOT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,19}$")
 _PROC_LOCK = threading.RLock()
 
 
+def ensure_secure_state_dir(state_dir: Path | None = None) -> Path:
+    """Create state_dir with 0700 permissions on POSIX to protect tokens on shared hosts."""
+    target = Path(state_dir) if state_dir is not None else STATE_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o700)
+    return target
+
+
+def write_secure_atomic(dest_path: Path, text: str) -> None:
+    """Write UTF-8 text atomically with 0600 permissions on POSIX."""
+    ensure_secure_state_dir(dest_path.parent)
+    tmp_path = dest_path.with_name(f".{dest_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    data = text.encode("utf-8")
+    try:
+        if os.name != "nt":
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        else:
+            tmp_path.write_bytes(data)
+        os.replace(tmp_path, dest_path)
+        if os.name != "nt":
+            with contextlib.suppress(OSError):
+                os.chmod(dest_path, 0o600)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def normalize_slot(slot: str | None) -> str:
     """Validate and normalize a worker slot identifier (default '1')."""
     s = (slot or "1").strip().lower()
@@ -82,6 +116,33 @@ class Settings:
     def kernel_ref_for_slot(self, slot: str = "1", mode: str = "live") -> str:
         return f"{self.kaggle_username}/{self.kernel_slug_for_slot(slot, mode=mode)}"
 
+    def batch_run_slug(self, slot: str = "batch-1", run_id: str = "") -> str:
+        """Generate an isolated per-run batch slug so cancelling a run never deletes prior outputs."""
+        s = normalize_slot(slot)
+        suffix = s[6:] if s.startswith("batch-") and len(s) > 6 else s
+        clean_run = re.sub(r"[^a-z0-9]+", "", (run_id or "").lower())[:8]
+        if not clean_run:
+            return self.kernel_slug_for_slot(s, mode="batch")
+        return f"kgsh-batch-{suffix}-{clean_run}"
+
+    def batch_run_ref(self, slot: str = "batch-1", run_id: str = "") -> str:
+        return f"{self.kaggle_username}/{self.batch_run_slug(slot, run_id)}"
+
+    def is_ephemeral_managed_kernel(self, kernel_ref: str) -> bool:
+        """Return True iff `kernel_ref` is a managed worker/batch runner owned by this account."""
+        base = str(kernel_ref or "").strip()
+        if not base or "/" not in base:
+            return False
+        parts = base.split("/")
+        owner, slug = parts[0], parts[1]
+        if owner.lower() != self.kaggle_username.lower():
+            return False
+        return (
+            slug == self.kernel_slug
+            or slug.startswith(f"{self.kernel_slug}-")
+            or slug.startswith("kgsh-batch-")
+        )
+
     def state_dataset_slug_for_slot(self, slot: str = "1") -> str:
         s = normalize_slot(slot)
         return self.state_dataset_slug if s == "1" else f"{self.state_dataset_slug}-{s}"
@@ -110,6 +171,7 @@ class ActiveSession:
     version_number: int | None = None
     competition: str = ""
     enable_internet: bool = True
+    status: str = ""  # "" | "provisioning" | "ready" | "unreachable"
 
     @property
     def base_url(self) -> str:
@@ -125,10 +187,14 @@ class ActiveSession:
 @contextlib.contextmanager
 def _locked_state_store(timeout_sec: float = 10.0):
     """Acquire both thread lock and cross-process OS file lock for sessions.json."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_secure_state_dir(STATE_DIR)
     lock_file = STATE_DIR / "sessions.lock"
     with _PROC_LOCK:
-        fh = open(lock_file, "a+b")
+        if os.name != "nt":
+            fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+            fh = os.fdopen(fd, "a+b")
+        else:
+            fh = open(lock_file, "a+b")
         try:
             fh.seek(0, os.SEEK_END)
             if fh.tell() == 0:
@@ -208,12 +274,9 @@ def _read_store_unlocked() -> dict[str, ActiveSession]:
 
 
 def _write_store_unlocked(slots: dict[str, ActiveSession]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
     sessions_path = STATE_DIR / "sessions.json"
-    tmp_path = sessions_path.with_name(f"sessions.{threading.get_ident()}.tmp")
     payload = {"slots": {k: asdict(v) for k, v in sorted(slots.items())}}
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp_path, sessions_path)
+    write_secure_atomic(sessions_path, json.dumps(payload, indent=2))
 
 
 def configure_kaggle_env(username: str, secret: str) -> None:

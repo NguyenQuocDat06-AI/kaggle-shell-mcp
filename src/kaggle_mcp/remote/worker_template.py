@@ -233,6 +233,18 @@ def query_disk_gb(path: Path) -> dict:
         return {"used_gb": 0.0, "free_gb": 0.0, "total_gb": 0.0}
 
 
+_SCRUBBED_SECRET_ENV_KEYS = ("KAGGLE_API_TOKEN", "KAGGLE_KEY", "TS_AUTHKEY")
+_PUBLISH_LOCK = threading.Lock()
+
+
+def _scrubbed_child_env() -> dict[str, str]:
+    """Return a copy of os.environ with account/tunnel secrets stripped so child jobs cannot leak them."""
+    env = os.environ.copy()
+    for k in _SCRUBBED_SECRET_ENV_KEYS:
+        env.pop(k, None)
+    return env
+
+
 class PtySession:
     """Persistent bash PTY preserving cwd, shell variables, and virtualenvs."""
 
@@ -256,7 +268,7 @@ class PtySession:
         winsize = struct.pack("HHHH", 40, 160, 0, 0)
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-        env = os.environ.copy()
+        env = _scrubbed_child_env()
         env["TERM"] = "dumb"
         env["PS1"] = ""
 
@@ -325,7 +337,11 @@ class PtySession:
 
             os.write(self.master_fd, payload.encode("utf-8", errors="replace"))
 
-            chunks: list[bytes] = []
+            head_buf = bytearray()
+            tail_buf = bytearray()
+            total_seen = 0
+            head_cap = 32768
+            tail_cap = 98304
             buf_tail = ""
             exit_code = -1
             timed_out = False
@@ -355,7 +371,17 @@ class PtySession:
                         data = os.read(self.master_fd, 65536)
                         if not data:
                             break
-                        chunks.append(data)
+                        if len(head_buf) < head_cap:
+                            need = head_cap - len(head_buf)
+                            head_buf.extend(data[:need])
+                            rem_data = data[need:]
+                        else:
+                            rem_data = data
+                        if rem_data:
+                            tail_buf.extend(rem_data)
+                            if len(tail_buf) > tail_cap:
+                                del tail_buf[:-tail_cap]
+                        total_seen += len(data)
                         with self._live_lock:
                             self._live_buf.extend(data)
                             if len(self._live_buf) > 24576:
@@ -381,7 +407,15 @@ class PtySession:
                     self._live_sentinel = ""
                     self._live_buf.clear()
 
-            raw_text = b"".join(chunks).decode("utf-8", errors="replace")
+            if total_seen <= head_cap + len(tail_buf):
+                combined = bytes(head_buf) + bytes(tail_buf)
+                raw_text = combined.decode("utf-8", errors="replace")
+            else:
+                raw_text = (
+                    head_buf.decode("utf-8", errors="replace")
+                    + "\n\n... [truncated middle stream] ...\n\n"
+                    + tail_buf.decode("utf-8", errors="replace")
+                )
             idx = raw_text.find(sentinel_prefix)
             if idx != -1:
                 raw_text = raw_text[:idx]
@@ -475,15 +509,21 @@ class PtyManager:
                 return snap
         return None
 
+    def live_snapshots_by_session(self) -> dict[str, dict]:
+        with self._lock:
+            items = list(self._sessions.items())
+        out: dict[str, dict] = {}
+        for name, sess in items:
+            snap = sess.live_snapshot()
+            if snap is not None:
+                out[name] = snap
+        return out
+
     def interrupt(self, name: str = "default") -> bool:
         with self._lock:
             target = self._sessions.get(name)
-            sessions = list(self._sessions.values())
         if target is not None and target.interrupt():
             return True
-        for s in sessions:
-            if s.interrupt():
-                return True
         return False
 
     def close_all(self) -> None:
@@ -509,7 +549,9 @@ class JobManager:
             log_path = LOG_DIR / f"{job_id}.log"
             fh = open(log_path, "wb")
 
-            job_env = os.environ.copy()
+            job_env = _scrubbed_child_env()
+            job_env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+            job_env["KGSH_JOB_ID"] = job_id
             gpu_ids_clean = str(gpu_ids or "").strip()
             if gpu_ids_clean:
                 job_env["CUDA_VISIBLE_DEVICES"] = gpu_ids_clean
@@ -606,13 +648,19 @@ class JobManager:
         if not lp.is_file():
             return {"job": meta, "logs": ""}
 
-        raw = lp.read_bytes()
-        if len(raw) > 2 * 1024 * 1024:
-            raw = raw[-2 * 1024 * 1024 :]
+        size = lp.stat().st_size
+        max_tail_bytes = 2 * 1024 * 1024
+        with open(lp, "rb") as rf:
+            if size > max_tail_bytes:
+                rf.seek(size - max_tail_bytes)
+            raw = rf.read(max_tail_bytes)
         cleaned = clean_tqdm(raw.decode("utf-8", errors="replace"))
         lines = cleaned.splitlines()
         if grep:
-            pat = re.compile(grep, re.IGNORECASE)
+            try:
+                pat = re.compile(grep, re.IGNORECASE)
+            except re.error:
+                pat = re.compile(re.escape(grep), re.IGNORECASE)
             lines = [ln for ln in lines if pat.search(ln)]
         tail = lines[-max(1, int(tail_lines)) :]
         return {"job": meta, "logs": "\n".join(tail), "returned_lines": len(tail)}
@@ -674,6 +722,21 @@ class JobManager:
                 self.kill_job(jid, "SIGTERM")
             except Exception:
                 pass
+        if running_ids:
+            time.sleep(0.8)
+            with self._lock:
+                self._refresh_locked()
+                still_running = [jid for jid in running_ids if self._jobs.get(jid, {}).get("status") == "running"]
+            for jid in still_running:
+                try:
+                    self.kill_job(jid, "SIGKILL")
+                except Exception:
+                    pass
+        if hasattr(os, "sync"):
+            try:
+                os.sync()
+            except OSError:
+                pass
 
 
 class EventBus:
@@ -714,6 +777,40 @@ class EventBus:
             return self._seq, items
 
 
+class IdempotencyRegistry:
+    """Bounded deduplication cache preventing duplicate job/PTY execution on network retries."""
+
+    def __init__(self, maxlen: int = 512, ttl_sec: float = 900.0) -> None:
+        self._lock = threading.Lock()
+        self._maxlen = maxlen
+        self._ttl_sec = ttl_sec
+        self._cache: dict[str, tuple[float, int, dict]] = {}
+
+    def get(self, key: str) -> tuple[int, dict] | None:
+        if not key:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            item = self._cache.get(key)
+            if item is None:
+                return None
+            ts, code, data = item
+            if now - ts > self._ttl_sec:
+                self._cache.pop(key, None)
+                return None
+            return code, dict(data)
+
+    def put(self, key: str, code: int, data: dict) -> None:
+        if not key:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if len(self._cache) >= self._maxlen:
+                oldest = min(self._cache, key=lambda k: self._cache[k][0])
+                self._cache.pop(oldest, None)
+            self._cache[key] = (now, code, dict(data))
+
+
 class WorkerState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -724,6 +821,7 @@ class WorkerState:
         self.pty_mgr = PtyManager()
         self.job_mgr = JobManager()
         self.events = EventBus()
+        self.idempotency = IdempotencyRegistry()
         self.gpu_util_window: deque[float] = deque(maxlen=6)
 
     def touch_rpc(self) -> None:
@@ -742,25 +840,33 @@ def ensure_kaggle_sdk_for_publish() -> None:
     if STATE.kaggle_sdk_ready:
         return
     if KAGGLE_SECRET.startswith("KGAT_"):
-        os.environ["KAGGLE_API_TOKEN"] = KAGGLE_SECRET
-        os.environ.pop("KAGGLE_KEY", None)
-        # Ensure Kaggle SDK inside container supports KGAT_ bearer tokens + six
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle>=2.0.0", "six"],
+            [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle>=2.2.0", "six"],
             check=False,
         )
-    else:
-        os.environ["KAGGLE_KEY"] = KAGGLE_SECRET
-    os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
     STATE.kaggle_sdk_ready = True
+
+
+def _with_ephemeral_kaggle_auth(fn):
+    """Temporarily set Kaggle env vars inside _PUBLISH_LOCK, scrubbing them immediately afterwards."""
+    with _PUBLISH_LOCK:
+        ensure_kaggle_sdk_for_publish()
+        os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+        if KAGGLE_SECRET.startswith("KGAT_"):
+            os.environ["KAGGLE_API_TOKEN"] = KAGGLE_SECRET
+            os.environ.pop("KAGGLE_KEY", None)
+        else:
+            os.environ["KAGGLE_KEY"] = KAGGLE_SECRET
+        try:
+            return fn()
+        finally:
+            os.environ.pop("KAGGLE_API_TOKEN", None)
+            os.environ.pop("KAGGLE_KEY", None)
 
 
 def publish_state(status: str = "running") -> None:
     """Publish current tunnel URL and session heartbeat to private Kaggle Dataset."""
     try:
-        ensure_kaggle_sdk_for_publish()
-        from kaggle.api.kaggle_api_extended import KaggleApi
-
         ds_dir = TMP_DIR / "state_ds"
         ds_dir.mkdir(parents=True, exist_ok=True)
 
@@ -782,24 +888,29 @@ def publish_state(status: str = "running") -> None:
         }
         (ds_dir / "state.json").write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
 
-        api = KaggleApi()
-        api.authenticate()
-        try:
-            api.dataset_create_version(
-                folder=str(ds_dir),
-                version_notes=f"{status}:{SESSION_ID[:8]}",
-                quiet=True,
-                convert_to_csv=False,
-                dir_mode="skip",
-            )
-        except Exception:
-            api.dataset_create_new(
-                folder=str(ds_dir),
-                public=False,
-                quiet=True,
-                convert_to_csv=False,
-                dir_mode="skip",
-            )
+        def _do_pub() -> None:
+            from kaggle.api.kaggle_api_extended import KaggleApi
+
+            api = KaggleApi()
+            api.authenticate()
+            try:
+                api.dataset_create_version(
+                    folder=str(ds_dir),
+                    version_notes=f"{status}:{SESSION_ID[:8]}",
+                    quiet=True,
+                    convert_to_csv=False,
+                    dir_mode="skip",
+                )
+            except Exception:
+                api.dataset_create_new(
+                    folder=str(ds_dir),
+                    public=False,
+                    quiet=True,
+                    convert_to_csv=False,
+                    dir_mode="skip",
+                )
+
+        _with_ephemeral_kaggle_auth(_do_pub)
         print(f"[worker] published state ({status}) -> {STATE_DATASET_REF}", flush=True)
     except Exception as exc:
         print(f"[worker] publish_state error: {exc}", flush=True)
@@ -861,16 +972,27 @@ def start_tailscale_if_configured() -> None:
 
 def cloudflared_supervisor() -> None:
     cf_bin = TMP_DIR / "cloudflared"
-    if not cf_bin.is_file():
-        urllib.request.urlretrieve(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            cf_bin,
-        )
-        cf_bin.chmod(0o755)
+    quic_failures = 0
 
     while not SHUTDOWN_EVENT.is_set():
-        # Prefer QUIC UDP edge connection (zero TCP HoL blocking); fall back to auto HTTP/2 if UDP fails quickly
-        proto_args = ["--protocol", "quic"] if not STATE.tunnel_url else []
+        if not cf_bin.is_file() or cf_bin.stat().st_size < 1024 * 1024:
+            cf_tmp = TMP_DIR / f"cloudflared.{os.getpid()}.tmp"
+            try:
+                urllib.request.urlretrieve(
+                    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                    cf_tmp,
+                )
+                cf_tmp.chmod(0o755)
+                os.replace(cf_tmp, cf_bin)
+            except Exception as exc:
+                cf_tmp.unlink(missing_ok=True)
+                print(f"[worker] cloudflared download retry warning: {exc}", flush=True)
+                time.sleep(3.0)
+                continue
+
+        # Prefer QUIC UDP edge connection; switch permanently to HTTP/2 after 2 quick QUIC failures
+        use_quic = quic_failures < 2
+        proto_args = ["--protocol", "quic"] if use_quic else ["--protocol", "http2"]
         proc = subprocess.Popen(
             [
                 str(cf_bin),
@@ -886,6 +1008,7 @@ def cloudflared_supervisor() -> None:
             bufsize=1,
         )
         t_start = time.monotonic()
+        got_url = False
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -893,6 +1016,7 @@ def cloudflared_supervisor() -> None:
                     break
                 m = TRYCF_URL_RE.search(line)
                 if m:
+                    got_url = True
                     url = m.group(0)
                     if url != STATE.tunnel_url:
                         STATE.tunnel_url = url
@@ -904,9 +1028,30 @@ def cloudflared_supervisor() -> None:
             if proc.poll() is None:
                 proc.terminate()
         if not SHUTDOWN_EVENT.is_set():
-            if time.monotonic() - t_start < 6.0 and proto_args:
-                STATE.tunnel_url = ""
+            if use_quic and (not got_url or time.monotonic() - t_start < 8.0):
+                quic_failures += 1
             time.sleep(2.0)
+
+
+def _assert_no_symlink_parents(dest_dir: Path, rel_name: str) -> Path:
+    parts = Path(rel_name).parts
+    for p in parts:
+        if p in {"..", "/", "\\"} or ":" in p:
+            raise ValueError(f"Blocked path traversal in archive: {rel_name}")
+    cur = dest_dir
+    for p in parts[:-1]:
+        if p in {"", "."}:
+            continue
+        cur = cur / p
+        if cur.is_symlink():
+            raise ValueError(f"Blocked extraction through symlink directory: {cur}")
+    leaf = cur / parts[-1] if parts else dest_dir
+    if leaf != dest_dir and leaf.is_symlink():
+        raise ValueError(f"Blocked overwrite of existing symlink: {leaf}")
+    target = leaf.resolve()
+    if target != dest_dir and not target.is_relative_to(dest_dir):
+        raise ValueError(f"Blocked path traversal in archive: {rel_name}")
+    return target
 
 
 def safe_extract_tar(tar_bytes: bytes, dest_dir: Path) -> int:
@@ -914,13 +1059,11 @@ def safe_extract_tar(tar_bytes: bytes, dest_dir: Path) -> int:
     dest_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
-        for member in tf.getmembers():
-            target = (dest_dir / member.name).resolve()
-            if not target.is_relative_to(dest_dir):
-                raise ValueError(f"Blocked path traversal in archive: {member.name}")
-            if member.issym() or member.islnk():
+        for member in tf:
+            if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
                 continue
-            tf.extract(member, path=dest_dir)
+            _assert_no_symlink_parents(dest_dir, member.name)
+            tf.extract(member, path=dest_dir, filter="data")
             count += 1
     return count
 
@@ -931,12 +1074,10 @@ def safe_extract_tar_file(tar_path: Path, dest_dir: Path) -> int:
     count = 0
     with tarfile.open(tar_path, mode="r:*") as tf:
         for member in tf:
-            target = (dest_dir / member.name).resolve()
-            if not target.is_relative_to(dest_dir):
-                raise ValueError(f"Blocked path traversal in archive: {member.name}")
-            if member.issym() or member.islnk():
+            if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
                 continue
-            tf.extract(member, path=dest_dir)
+            _assert_no_symlink_parents(dest_dir, member.name)
+            tf.extract(member, path=dest_dir, filter="data")
             count += 1
     return count
 
@@ -947,11 +1088,9 @@ def safe_extract_zip(zip_path: Path, dest_dir: Path) -> int:
     count = 0
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
-            target = (dest_dir / info.filename).resolve()
-            if not target.is_relative_to(dest_dir):
-                raise ValueError(f"Blocked path traversal in zip: {info.filename}")
             if ((info.external_attr >> 16) & 0o170000) == 0o120000:
                 continue
+            _assert_no_symlink_parents(dest_dir, info.filename)
             zf.extract(info, path=dest_dir)
             count += 1
     return count
@@ -962,6 +1101,14 @@ def _assert_writable_path(raw_path: str, *, allow_root: bool = False) -> Path:
     if not raw:
         raise PermissionError("Empty remote path.")
     target = Path(raw).resolve()
+    runtime_dir_obj = globals().get("TMP_DIR")
+    runtime_root = (
+        Path(runtime_dir_obj).resolve()
+        if runtime_dir_obj is not None
+        else Path("/tmp/kaggle_mcp_runtime").resolve()
+    )
+    if target == runtime_root or target.is_relative_to(runtime_root):
+        raise PermissionError(f"Refused modification inside protected worker runtime dir: {target}")
     roots = [WORKING_DIR.resolve(), Path("/tmp").resolve()]
     for root in roots:
         if target == root:
@@ -1452,19 +1599,21 @@ class WorkerHandler(BaseHTTPRequestHandler):
             if self.path == "/fs/read_text":
                 req = self._read_json()
                 fp = Path(req["path"])
-                max_b = min(65536, max(1024, int(req.get("max_bytes", 32768))))
+                max_b = min(524288, max(1024, int(req.get("max_bytes", 32768))))
                 if not fp.is_file():
                     self._send_json(404, {"error": f"File not found: {fp}"})
                     return
                 size = fp.stat().st_size
                 with open(fp, "rb") as rf:
                     raw_b = rf.read(max_b)
+                is_binary = b"\x00" in raw_b[:8192]
                 self._send_json(
                     200,
                     {
                         "path": str(fp),
                         "size_bytes": size,
                         "truncated": size > max_b,
+                        "is_binary": is_binary,
                         "content": raw_b.decode("utf-8", errors="replace"),
                     },
                 )
@@ -1472,8 +1621,24 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
             if self.path == "/fs/write_text":
                 req = self._read_json()
-                fp = Path(req["path"])
+                fp = _assert_writable_path(req["path"])
                 raw_bytes = str(req.get("content", "")).encode("utf-8")
+                if (
+                    fp.is_file()
+                    and fp.stat().st_size > 65536
+                    and len(raw_bytes) <= 65536
+                    and not bool(req.get("allow_overwrite_large", False))
+                ):
+                    self._send_json(
+                        412,
+                        {
+                            "error": (
+                                f"Refused to overwrite {fp} ({fp.stat().st_size} bytes) with <=64KB buffer "
+                                "without allow_overwrite_large=True (prevents file truncation)."
+                            )
+                        },
+                    )
+                    return
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_bytes(raw_bytes)
                 STATE.events.push(
@@ -1489,18 +1654,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
             if self.path == "/fs/mkdir":
                 req = self._read_json()
-                dp = Path(req["path"])
+                dp = _assert_writable_path(req["path"])
                 dp.mkdir(parents=True, exist_ok=True)
                 self._send_json(200, {"ok": True, "path": str(dp)})
                 return
 
             if self.path == "/fs/delete":
                 req = self._read_json()
-                target = Path(req["path"]).resolve()
-                allowed_roots = (str(WORKING_DIR.resolve()) + "/", "/tmp/")
-                if not any(str(target).startswith(r) for r in allowed_roots):
-                    self._send_json(403, {"error": f"Refused delete outside working/tmp: {target}"})
-                    return
+                target = _assert_writable_path(req["path"])
                 if not target.exists():
                     self._send_json(404, {"error": f"Not found: {target}"})
                     return
@@ -1641,7 +1802,13 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 name_glob = str(req.get("name_glob") or "").strip()
                 content_regex = str(req.get("content_regex") or "").strip()
                 max_results = min(300, max(1, int(req.get("max_results", 150))))
-                rx = re.compile(content_regex, re.IGNORECASE) if content_regex else None
+                if content_regex:
+                    try:
+                        rx = re.compile(content_regex, re.IGNORECASE)
+                    except re.error:
+                        rx = re.compile(re.escape(content_regex), re.IGNORECASE)
+                else:
+                    rx = None
                 skip_dirs = {".git", "__pycache__", "node_modules", ".venv"}
                 matches: list[dict] = []
                 truncated = False
@@ -1713,9 +1880,6 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 public = bool(req.get("public", False))
                 ds_ref = f"{KAGGLE_USERNAME}/{slug}"
 
-                ensure_kaggle_sdk_for_publish()
-                from kaggle.api.kaggle_api_extended import KaggleApi
-
                 stage_dir = TMP_DIR / f"pub_{uuid.uuid4().hex[:8]}"
                 stage_dir.mkdir(parents=True, exist_ok=True)
                 try:
@@ -1739,24 +1903,30 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         json.dumps(meta, indent=2),
                         encoding="utf-8",
                     )
-                    api = KaggleApi()
-                    api.authenticate()
-                    try:
-                        api.dataset_create_version(
-                            folder=str(stage_dir),
-                            version_notes=notes,
-                            quiet=True,
-                            convert_to_csv=False,
-                            dir_mode="zip",
-                        )
-                    except Exception:
-                        api.dataset_create_new(
-                            folder=str(stage_dir),
-                            public=public,
-                            quiet=True,
-                            convert_to_csv=False,
-                            dir_mode="zip",
-                        )
+
+                    def _do_pub_ds() -> None:
+                        from kaggle.api.kaggle_api_extended import KaggleApi
+
+                        api = KaggleApi()
+                        api.authenticate()
+                        try:
+                            api.dataset_create_version(
+                                folder=str(stage_dir),
+                                version_notes=notes,
+                                quiet=True,
+                                convert_to_csv=False,
+                                dir_mode="zip",
+                            )
+                        except Exception:
+                            api.dataset_create_new(
+                                folder=str(stage_dir),
+                                public=public,
+                                quiet=True,
+                                convert_to_csv=False,
+                                dir_mode="zip",
+                            )
+
+                    _with_ephemeral_kaggle_auth(_do_pub_ds)
                 finally:
                     shutil.rmtree(stage_dir, ignore_errors=True)
 
@@ -1813,11 +1983,17 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "events": new_events,
                         "log_chunk": log_chunk,
                         "pty_live": STATE.pty_mgr.live_snapshot(),
+                        "pty_sessions_live": STATE.pty_mgr.live_snapshots_by_session(),
                     },
                 )
                 return
 
             if self.path == "/term/exec":
+                idem_key = (self.headers.get("X-Idempotency-Key") or "").strip()
+                cached = STATE.idempotency.get(idem_key)
+                if cached is not None:
+                    self._send_json(cached[0], cached[1])
+                    return
                 req = self._read_json()
                 res = STATE.pty_mgr.get(req.get("session", "default")).exec_command(
                     command=req["command"],
@@ -1831,6 +2007,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     exit_code=res.get("exit_code"),
                     duration_sec=res.get("duration_sec"),
                 )
+                STATE.idempotency.put(idem_key, 200, res)
                 self._send_json(200, res)
                 return
 
@@ -1851,6 +2028,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 return
 
             if self.path == "/jobs/spawn":
+                idem_key = (self.headers.get("X-Idempotency-Key") or "").strip()
+                cached = STATE.idempotency.get(idem_key)
+                if cached is not None:
+                    self._send_json(cached[0], cached[1])
+                    return
                 req = self._read_json()
                 meta = STATE.job_mgr.spawn(
                     command=req["command"],
@@ -1865,6 +2047,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     summary=f"job_spawn ({meta['name']}){gpu_tag}: {req['command']}",
                     detail=f"job_id={meta['job_id']} pid={meta['pid']}",
                 )
+                STATE.idempotency.put(idem_key, 200, meta)
                 self._send_json(200, meta)
                 return
 
@@ -1903,7 +2086,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 return
 
             if self.path == "/fs/upload":
-                remote_dest = Path(self.headers.get("X-Remote-Path", str(WORKING_DIR)))
+                remote_dest = _assert_writable_path(
+                    self.headers.get("X-Remote-Path", str(WORKING_DIR)),
+                    allow_root=True,
+                )
                 length = int(self.headers.get("Content-Length", "0"))
                 tar_bytes = self.rfile.read(length)
                 extracted = safe_extract_tar(tar_bytes, remote_dest)

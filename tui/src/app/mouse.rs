@@ -64,7 +64,21 @@ impl App {
                                 self.editor_mouse_selecting = true;
                             }
                         } else if !rect_contains(modal_rect, x, y) {
-                            self.modal = None;
+                            let dirty_guard = match self.modal {
+                                Some(Modal::FileEditor(ref mut m)) if m.dirty && !m.confirm_discard => {
+                                    m.confirm_discard = true;
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if dirty_guard {
+                                self.notify(
+                                    "Unsaved changes! Press Esc or click outside again to discard, or Ctrl+S to save.",
+                                    true,
+                                );
+                            } else {
+                                self.modal = None;
+                            }
                             self.editor_mouse_selecting = false;
                         }
                     }
@@ -574,8 +588,8 @@ impl App {
             "drawer-open" => self.execute_context_action("open"),
             "drawer-transfer" => self.transfer_to_opposite(),
             "drawer-copy" => {
-                if let Some(ref pd) = self.preview_drawer {
-                    copy_clipboard(&pd.lines.join("\n"));
+                if let Some(txt) = self.preview_drawer.as_ref().map(|pd| pd.lines.join("\n")) {
+                    self.set_clipboard_text(&txt);
                     self.notify("Copied preview text", false);
                 }
             }

@@ -24,6 +24,7 @@ pub struct ActiveSession {
     pub version_number: Option<i64>,
     pub competition: String,
     pub enable_internet: bool,
+    pub status: String,
 }
 
 impl ActiveSession {
@@ -223,12 +224,33 @@ pub fn load_profiles(state_dir: &Path) -> Vec<BootProfile> {
 
 fn write_profiles_atomic(state_dir: &Path, items: &[BootProfile]) -> Result<()> {
     fs::create_dir_all(state_dir).with_context(|| format!("create {:?}", state_dir))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700));
+    }
     let path = state_dir.join("profiles.json");
     let tmp = state_dir.join(format!(".profiles.json.{}.tmp", std::process::id()));
     let body = serde_json::to_string_pretty(&ProfilesWrapper {
         profiles: items.to_vec(),
     })?;
-    fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp, body)?;
+    }
     fs::rename(&tmp, &path)?;
     Ok(())
 }

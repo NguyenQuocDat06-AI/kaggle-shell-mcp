@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -47,11 +46,8 @@ def profiles_path() -> Path:
 
 def _write_profiles_atomic(items: list[BootProfile]) -> None:
     path = profiles_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     payload = {"profiles": [asdict(p) for p in items]}
-    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp_path, path)
+    config.write_secure_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def load_profiles() -> list[BootProfile]:

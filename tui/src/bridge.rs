@@ -8,12 +8,13 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::state::find_repo_root;
+use crate::state::{find_repo_root, resolve_state_dir};
 
 #[derive(Debug, Clone)]
 pub struct PythonBridge {
     pub python_exe: String,
     pub workdir: Option<PathBuf>,
+    pub state_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,13 +101,16 @@ impl PythonBridge {
         Self {
             python_exe,
             workdir: repo,
+            state_dir: resolve_state_dir(None),
         }
     }
 
     pub async fn call(&self, action: &str, payload: Value) -> Result<Value> {
         let mut cmd = Command::new(&self.python_exe);
         cmd.arg("-m").arg("kaggle_mcp.bridge").arg(action);
-        cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
+        cmd.env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("KAGGLE_MCP_HOME", &self.state_dir);
         if let Some(ref wd) = self.workdir {
             if Path::new(wd).join("src").is_dir() {
                 cmd.current_dir(wd);

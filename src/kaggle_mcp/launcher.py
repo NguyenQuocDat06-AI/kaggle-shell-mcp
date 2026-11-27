@@ -6,6 +6,7 @@ import base64
 import contextlib
 import json
 import secrets
+import shutil
 import sys
 import tempfile
 import time
@@ -19,7 +20,9 @@ from .config import (
     STATE_DIR,
     ActiveSession,
     Settings,
+    clear_active_session,
     configure_kaggle_env,
+    ensure_secure_state_dir,
     load_active_session,
     normalize_slot,
     save_active_session,
@@ -32,6 +35,14 @@ TERMINAL_KERNEL_STATUSES = {
     "CANCEL_ACKNOWLEDGED",
     "CANCEL_REQUESTED",
 }
+
+
+def strip_kernel_version(kernel_ref: str) -> str:
+    """Convert `owner/slug/12` -> `owner/slug` for APIs like `kernels_delete` & `kernels_output`."""
+    parts = [p for p in str(kernel_ref or "").strip().split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return str(kernel_ref or "").strip()
 
 
 @contextlib.contextmanager
@@ -93,7 +104,7 @@ def get_kernel_status(api: Any, kernel_ref: str) -> dict[str, str]:
     """Return normalized {'status': ..., 'failure_message': ...} for a Kaggle kernel."""
     try:
         with protect_stdout():
-            resp = api.kernels_status(kernel_ref)
+            resp = api.kernels_status(strip_kernel_version(kernel_ref))
         raw_status = getattr(resp, "status", resp)
         name = getattr(raw_status, "name", str(raw_status)).split(".")[-1].upper()
         failure = getattr(resp, "failure_message", "") or ""
@@ -104,6 +115,20 @@ def get_kernel_status(api: Any, kernel_ref: str) -> dict[str, str]:
         if "404" in msg or "notfound" in low or "not found" in low or "cannot access kernel" in low:
             return {"status": "NOT_CREATED_YET", "failure_message": ""}
         return {"status": "UNKNOWN", "failure_message": msg}
+
+
+def wait_for_kernel_terminal(api: Any, kernel_ref: str, timeout_sec: float = 60.0) -> str:
+    """Poll Kaggle API until kernel reaches a terminal state (e.g. COMPLETE after /shutdown)."""
+    deadline = time.monotonic() + max(1.0, float(timeout_sec))
+    last_status = "UNKNOWN"
+    base_ref = strip_kernel_version(kernel_ref)
+    while time.monotonic() < deadline:
+        info = get_kernel_status(api, base_ref)
+        last_status = info["status"]
+        if last_status in TERMINAL_KERNEL_STATUSES or last_status == "NOT_CREATED_YET":
+            return last_status
+        time.sleep(3.0)
+    return last_status
 
 
 def ensure_state_dataset(api: Any, settings: Settings, slot: str = "1") -> str:
@@ -199,7 +224,8 @@ def build_bootstrap_bundle(
     kernel_slug = settings.kernel_slug_for_slot(s, mode="live")
     state_ds_ref = settings.state_dataset_ref_for_slot(s)
 
-    bundle_dir = STATE_DIR / f"build_bundle_{s}"
+    ensure_secure_state_dir(STATE_DIR)
+    bundle_dir = STATE_DIR / f"build_bundle_{s}_{session_id[:6]}"
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     template_path = Path(__file__).resolve().parent / "remote" / "worker_template.py"
@@ -274,50 +300,89 @@ def launch_worker(
     comp_list = normalize_str_list(competition)
     api = get_kaggle_api(settings)
 
+    session_id = ""
+    worker_token = ""
+    version_number: int | None = None
+    created_at = time.time()
+    resumed_provisioning = False
+
     existing = load_active_session(s)
     if existing and existing.mode == "live" and not force_new:
-        ping = probe_worker_ping(existing.base_url, existing.session_id)
-        if ping:
-            return {
-                "slot": s,
-                "reused_existing": True,
-                "session_id": existing.session_id,
-                "kernel_ref": existing.kernel_ref,
-                "accelerator": existing.accelerator,
-                "endpoint": existing.base_url,
-                "uptime_sec": ping.get("uptime_sec"),
-            }
+        if existing.base_url:
+            ping = probe_worker_ping(existing.base_url, existing.session_id)
+            if ping:
+                return {
+                    "slot": s,
+                    "reused_existing": True,
+                    "session_id": existing.session_id,
+                    "kernel_ref": existing.kernel_ref,
+                    "accelerator": existing.accelerator,
+                    "endpoint": existing.base_url,
+                    "uptime_sec": ping.get("uptime_sec"),
+                }
+        elif existing.worker_token and (time.time() - existing.created_at) < 900:
+            # Resume waiting for an already-pushed provisioning kernel instead of pushing a duplicate version
+            kinfo = get_kernel_status(api, existing.kernel_ref or kernel_ref)
+            if kinfo["status"] in {"QUEUED", "RUNNING"}:
+                session_id = existing.session_id
+                worker_token = existing.worker_token
+                version_number = existing.version_number
+                created_at = existing.created_at
+                resumed_provisioning = True
 
-    ensure_state_dataset(api, settings, slot=s)
+    if not resumed_provisioning:
+        ensure_state_dataset(api, settings, slot=s)
 
-    session_id = secrets.token_hex(12)
-    worker_token = secrets.token_hex(32)
-    bundle_dir = build_bootstrap_bundle(
-        settings=settings,
-        session_id=session_id,
-        worker_token=worker_token,
-        gpu=gpu,
-        idle_timeout_min=idle_timeout_min,
-        mount_datasets=mount_datasets,
-        chain_previous_output=chain_previous_output,
-        slot=s,
-        accelerator=accelerator,
-        competition=comp_list,
-        mount_models=mount_models,
-    )
-
-    record_local_activity(
-        s,
-        "mcp",
-        "boot_start",
-        f"Provisioning slot '{s}' ({acc_spec.label}) -> {kernel_ref}",
-    )
-    with protect_stdout():
-        push_resp = api.kernels_push(
-            str(bundle_dir),
-            acc=acc_spec.machine_shape,
+        session_id = secrets.token_hex(12)
+        worker_token = secrets.token_hex(32)
+        created_at = time.time()
+        bundle_dir = build_bootstrap_bundle(
+            settings=settings,
+            session_id=session_id,
+            worker_token=worker_token,
+            gpu=gpu,
+            idle_timeout_min=idle_timeout_min,
+            mount_datasets=mount_datasets,
+            chain_previous_output=chain_previous_output,
+            slot=s,
+            accelerator=accelerator,
+            competition=comp_list,
+            mount_models=mount_models,
         )
-    version_number = validate_push_response(push_resp)
+        try:
+            record_local_activity(
+                s,
+                "mcp",
+                "boot_start",
+                f"Provisioning slot '{s}' ({acc_spec.label}) -> {kernel_ref}",
+            )
+            with protect_stdout():
+                push_resp = api.kernels_push(
+                    str(bundle_dir),
+                    acc=acc_spec.machine_shape,
+                )
+            version_number = validate_push_response(push_resp)
+        finally:
+            # Never leave rendered bootstrap_worker.py containing credentials on local disk
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+
+        # Persist worker_token immediately after push so SSH drops or 60s MCP timeouts never orphan the VM
+        provisioning_sess = ActiveSession(
+            session_id=session_id,
+            worker_token=worker_token,
+            kernel_ref=kernel_ref,
+            state_dataset_ref=state_ds_ref,
+            created_at=created_at,
+            idle_timeout_min=idle_timeout_min,
+            slot=s,
+            mode="live",
+            accelerator=acc_spec.label,
+            version_number=version_number,
+            competition=",".join(comp_list),
+            enable_internet=True,
+            status="provisioning",
+        )
+        save_active_session(provisioning_sess, slot=s)
 
     deadline = time.monotonic() + max(30, int(wait_ready_sec))
     last_kstatus = "PUSHED"
@@ -328,6 +393,7 @@ def launch_worker(
         last_kstatus = kinfo["status"]
 
         if last_kstatus in {"ERROR", "CANCELLED", "CANCEL_ACKNOWLEDGED"}:
+            clear_active_session(s)
             record_local_activity(
                 s,
                 "mcp",
@@ -358,7 +424,7 @@ def launch_worker(
                     state_dataset_ref=state_ds_ref,
                     tunnel_url=tunnel_url,
                     ts_url=ts_url if url == ts_url else "",
-                    created_at=time.time(),
+                    created_at=created_at,
                     idle_timeout_min=idle_timeout_min,
                     slot=s,
                     mode="live",
@@ -366,6 +432,7 @@ def launch_worker(
                     version_number=version_number,
                     competition=",".join(comp_list),
                     enable_internet=True,
+                    status="ready",
                 )
                 save_active_session(active, slot=s)
                 record_local_activity(
@@ -377,7 +444,7 @@ def launch_worker(
                 )
                 return {
                     "slot": s,
-                    "reused_existing": False,
+                    "reused_existing": resumed_provisioning,
                     "session_id": session_id,
                     "kernel_ref": kernel_ref,
                     "version_number": version_number,
@@ -389,24 +456,9 @@ def launch_worker(
                     "idle_timeout_min": idle_timeout_min,
                 }
 
-    pending = ActiveSession(
-        session_id=session_id,
-        worker_token=worker_token,
-        kernel_ref=kernel_ref,
-        state_dataset_ref=state_ds_ref,
-        created_at=time.time(),
-        idle_timeout_min=idle_timeout_min,
-        slot=s,
-        mode="live",
-        accelerator=acc_spec.label,
-        version_number=version_number,
-        competition=",".join(comp_list),
-        enable_internet=True,
-    )
-    save_active_session(pending, slot=s)
     return {
         "slot": s,
-        "reused_existing": False,
+        "reused_existing": resumed_provisioning,
         "ready": False,
         "session_id": session_id,
         "kernel_ref": kernel_ref,
@@ -415,7 +467,7 @@ def launch_worker(
         "kernel_status": last_kstatus,
         "message": (
             f"Kernel ({kernel_ref}) đã push (status={last_kstatus}) nhưng chưa nhận được tunnel sau {wait_ready_sec}s "
-            "(đang xếp hàng cấp phát phần cứng). Gọi kaggle_status sau ít giây để tự kết nối."
+            "(đang xếp hàng cấp phát phần cứng). Gọi kaggle_status hoặc kaggle_up lại sau ít giây để tự kết nối tiếp."
         ),
     }
 
@@ -463,11 +515,16 @@ def pull_kernel_outputs(
     local_dest: Path,
     slot: str = "1",
     kernel_ref: str = "",
+    wait_complete_sec: float = 0.0,
 ) -> list[str]:
     api = get_kaggle_api(settings)
     s = normalize_slot(slot)
     sess = load_active_session(s)
-    target_ref = kernel_ref or (sess.kernel_ref if sess and sess.kernel_ref else settings.kernel_ref_for_slot(s))
+    raw_ref = kernel_ref or (sess.kernel_ref if sess and sess.kernel_ref else settings.kernel_ref_for_slot(s))
+    target_ref = strip_kernel_version(raw_ref)
+
+    if wait_complete_sec > 0:
+        wait_for_kernel_terminal(api, target_ref, timeout_sec=wait_complete_sec)
 
     local_dest = local_dest.expanduser().resolve()
     local_dest.mkdir(parents=True, exist_ok=True)
@@ -479,3 +536,104 @@ def pull_kernel_outputs(
             quiet=True,
         )
     return list(files or [])
+
+
+def shutdown_slot(
+    settings: Settings,
+    slot: str = "1",
+    *,
+    pull_outputs: bool = False,
+    local_output_dir: str = "",
+    single_slot_dest: bool = False,
+    force: bool = False,
+    caller: str = "mcp",
+) -> dict[str, Any]:
+    """Verified 3-tier shutdown preventing silent GPU quota leaks when tunnel is down or mode=='batch'."""
+    from .client import WorkerClient
+
+    s = normalize_slot(slot)
+    sess = load_active_session(s)
+    raw_kref = sess.kernel_ref if (sess and sess.kernel_ref) else settings.kernel_ref_for_slot(s, mode="live")
+    base_kref = strip_kernel_version(raw_kref)
+    out: dict[str, Any] = {
+        "slot": s,
+        "kernel_ref": base_kref,
+        "stopped": False,
+        "shutdown_sent": False,
+    }
+
+    dest = (
+        Path(local_output_dir or "./kaggle_outputs")
+        if single_slot_dest
+        else (Path(local_output_dir) / f"slot_{s}" if local_output_dir else Path(f"./kaggle_outputs/slot_{s}"))
+    )
+
+    # Tier 1: Graceful in-band RPC `/shutdown` for live workers
+    if not sess or sess.mode == "live":
+        try:
+            client = WorkerClient(settings, slot=s, caller=caller)
+            out["worker_response"] = client.shutdown()
+            out["shutdown_sent"] = True
+            out["stopped"] = True
+        except Exception as exc:
+            out["shutdown_note"] = str(exc)
+
+    if out["shutdown_sent"]:
+        if pull_outputs:
+            out["pulled_files"] = pull_kernel_outputs(
+                settings,
+                dest,
+                slot=s,
+                kernel_ref=base_kref,
+                wait_complete_sec=60.0,
+            )
+        clear_active_session(s)
+        record_local_activity(s, caller, "shutdown", f"Gracefully shut down slot '{s}'")
+        return out
+
+    # Tier 2: Check actual Kaggle Kernel status out-of-band
+    api = get_kaggle_api(settings)
+    kinfo = get_kernel_status(api, base_kref)
+    kstatus = kinfo["status"]
+    out["kaggle_api_status"] = kstatus
+
+    if kstatus in TERMINAL_KERNEL_STATUSES or kstatus == "NOT_CREATED_YET":
+        out["stopped"] = True
+        if pull_outputs and kstatus == "COMPLETE":
+            out["pulled_files"] = pull_kernel_outputs(settings, dest, slot=s, kernel_ref=base_kref)
+        clear_active_session(s)
+        record_local_activity(s, caller, "shutdown", f"Cleaned ended slot '{s}' ({kstatus})")
+        return out
+
+    # Tier 3: Kernel is still QUEUED / RUNNING (or batch run) -> out-of-band cancel via ephemeral kernel delete
+    can_hard_delete = settings.is_ephemeral_managed_kernel(base_kref) and (
+        force or not pull_outputs or kstatus == "QUEUED"
+    )
+    if can_hard_delete:
+        try:
+            with protect_stdout():
+                api.kernels_delete(base_kref, no_confirm=True)
+            out["stopped"] = True
+            out["hard_cancelled"] = True
+            clear_active_session(s)
+            record_local_activity(
+                s,
+                caller,
+                "shutdown",
+                f"Hard-cancelled active kernel {base_kref} ({kstatus}) via Kaggle API",
+            )
+            return out
+        except Exception as exc:
+            out["cancel_error"] = str(exc)
+
+    # Refuse to wipe sessions.json while the remote VM is still burning GPU quota!
+    if sess is not None:
+        sess.status = "unreachable"
+        save_active_session(sess, slot=s)
+    out["session_kept"] = sess is not None
+    out["warning"] = (
+        f"Kernel {base_kref} is still {kstatus} on Kaggle and could not be stopped cleanly. "
+        "Session kept in sessions.json to prevent hidden GPU quota drain "
+        "(pass force=True / --force to delete the ephemeral runner, or stop it on kaggle.com)."
+    )
+    return out

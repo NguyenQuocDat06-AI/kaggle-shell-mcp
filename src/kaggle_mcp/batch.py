@@ -7,6 +7,7 @@ import json
 import queue
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from .config import (
     STATE_DIR,
     ActiveSession,
     Settings,
+    ensure_secure_state_dir,
     load_active_session,
     normalize_slot,
     save_active_session,
@@ -44,11 +46,11 @@ import base64
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tarfile
-import threading
 import time
 from pathlib import Path
 
@@ -63,6 +65,18 @@ DRAIN_AT_SEC = int(CFG.get("drain_at_sec", 41700))
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["KGSH_OUTPUT_DIR"] = "/kaggle/working"
+
+_SKIP_HARVEST_DIRS = {
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".venv",
+    "venv",
+    "node_modules",
+}
+_SKIP_HARVEST_SUFFIXES = {".pyc", ".pyo"}
 
 
 def install_offline_wheels() -> None:
@@ -85,6 +99,69 @@ def install_offline_wheels() -> None:
         )
 
 
+def _snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
+    snap: dict[str, tuple[int, int]] = {}
+    if not root.is_dir():
+        return snap
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_HARVEST_DIRS]
+        dp = Path(dirpath)
+        for fn in filenames:
+            fp = dp / fn
+            if fp.suffix.lower() in _SKIP_HARVEST_SUFFIXES or fp.is_symlink():
+                continue
+            try:
+                st = fp.stat()
+                rel = fp.relative_to(root).as_posix()
+                snap[rel] = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                continue
+    return snap
+
+
+def harvest_workspace_outputs(cwd: Path, baseline: dict[str, tuple[int, int]]) -> int:
+    """Copy new or modified artifacts from /tmp workspace back into /kaggle/working before exit."""
+    out_root = Path("/kaggle/working").resolve()
+    cwd_res = cwd.resolve()
+    if cwd_res == out_root or not out_root.is_dir() or not cwd_res.is_dir():
+        return 0
+
+    copied = 0
+    for dirpath, dirnames, filenames in os.walk(cwd_res):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_HARVEST_DIRS]
+        dp = Path(dirpath)
+        for fn in filenames:
+            fp = dp / fn
+            if fp.suffix.lower() in _SKIP_HARVEST_SUFFIXES or fp.is_symlink():
+                continue
+            try:
+                st = fp.stat()
+                rel = fp.relative_to(cwd_res).as_posix()
+            except OSError:
+                continue
+            prev = baseline.get(rel)
+            if prev is not None and prev == (st.st_size, st.st_mtime_ns):
+                continue
+            dest = out_root / rel
+            try:
+                if dest.is_file() and dest.stat().st_mtime_ns > st.st_mtime_ns:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fp, dest)
+                copied += 1
+            except OSError as exc:
+                print(f"[kgsh-batch] harvest warning for {rel}: {exc}", flush=True)
+
+    if hasattr(os, "sync"):
+        try:
+            os.sync()
+        except OSError:
+            pass
+    if copied:
+        print(f"[kgsh-batch] harvested {copied} new/modified output file(s) -> {out_root}", flush=True)
+    return copied
+
+
 def prepare_workspace() -> Path:
     raw_tar: bytes | None = None
     if INLINE_BUNDLE_B64:
@@ -98,12 +175,11 @@ def prepare_workspace() -> Path:
         return Path("/kaggle/working")
 
     work_root = Path("/tmp/kgsh_batch_work")
+    if work_root.exists():
+        shutil.rmtree(work_root, ignore_errors=True)
     work_root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:gz") as tf:
-        try:
-            tf.extractall(path=work_root, filter="data")
-        except TypeError:
-            tf.extractall(path=work_root)
+        tf.extractall(path=work_root, filter="data")
 
     if TOP_ENTRY:
         candidate = work_root / TOP_ENTRY
@@ -116,6 +192,7 @@ def main() -> int:
     t0 = time.monotonic()
     install_offline_wheels()
     cwd = prepare_workspace()
+    baseline = _snapshot_tree(cwd)
     print(f"[kgsh-batch] starting command in {cwd}: {COMMAND}", flush=True)
 
     proc = subprocess.Popen(
@@ -125,28 +202,40 @@ def main() -> int:
         start_new_session=True,
     )
 
-    drained = False
-    while proc.poll() is None:
-        elapsed = time.monotonic() - t0
-        if not drained and elapsed >= DRAIN_AT_SEC:
-            drained = True
-            print("[kgsh-batch] safe drain window reached; sending SIGTERM to flush checkpoints...", flush=True)
+    def _forward_term(_signum: int, _frame: object) -> None:
+        if proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        if elapsed >= MAX_LIFETIME_SEC:
-            print("[kgsh-batch] max safe lifetime reached; terminating cleanly (0) to preserve /kaggle/working.", flush=True)
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            return 0
-        time.sleep(2.0)
 
-    rc = proc.returncode or 0
-    print(f"[kgsh-batch] finished with exit_code={rc} in {time.monotonic() - t0:.1f}s", flush=True)
-    return rc
+    signal.signal(signal.SIGTERM, _forward_term)
+
+    drained = False
+    try:
+        while proc.poll() is None:
+            elapsed = time.monotonic() - t0
+            if not drained and elapsed >= DRAIN_AT_SEC:
+                drained = True
+                print("[kgsh-batch] safe drain window reached; sending SIGTERM to flush checkpoints...", flush=True)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if elapsed >= MAX_LIFETIME_SEC:
+                print("[kgsh-batch] max safe lifetime reached; terminating cleanly (0) to preserve /kaggle/working.", flush=True)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return 0
+            time.sleep(2.0)
+
+        rc = proc.returncode or 0
+        print(f"[kgsh-batch] finished with exit_code={rc} in {time.monotonic() - t0:.1f}s", flush=True)
+        return rc
+    finally:
+        harvest_workspace_outputs(cwd, baseline)
 
 
 if __name__ == "__main__":
@@ -282,7 +371,7 @@ def submit_offline_batch(
     mount_datasets: str | list[str] | None = None,
     mount_models: str | list[str] | None = None,
 ) -> dict[str, Any]:
-    """Bundle local code into a private Dataset and push a batch kernel (supports L4x4 / RTX Pro 6000 offline)."""
+    """Bundle local code into a private Dataset and push a run-scoped batch kernel."""
     s = normalize_slot(slot)
     acc_spec = resolve_accelerator(accelerator, gpu=True)
     api = get_kaggle_api(settings)
@@ -344,41 +433,46 @@ def submit_offline_batch(
     b64_cfg = base64.b64encode(json.dumps(batch_cfg).encode("utf-8")).decode("ascii")
     runner_src = OFFLINE_RUNNER_TEMPLATE.replace("__BATCH_CONFIG_B64__", b64_cfg)
 
-    kernel_ref = settings.kernel_ref_for_slot(s, mode="batch")
-    kernel_slug = settings.kernel_slug_for_slot(s, mode="batch")
-    bundle_dir = STATE_DIR / f"build_batch_{s}"
+    run_id = secrets.token_hex(3)
+    kernel_ref = settings.batch_run_ref(s, run_id)
+    kernel_slug = settings.batch_run_slug(s, run_id)
+    ensure_secure_state_dir(STATE_DIR)
+    bundle_dir = STATE_DIR / f"build_batch_{s}_{run_id}"
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    (bundle_dir / "offline_runner.py").write_text(runner_src, encoding="utf-8")
+    try:
+        (bundle_dir / "offline_runner.py").write_text(runner_src, encoding="utf-8")
 
-    kernel_meta: dict[str, Any] = {
-        "id": kernel_ref,
-        "title": kernel_slug,
-        "code_file": "offline_runner.py",
-        "language": "python",
-        "kernel_type": "script",
-        "is_private": True,
-        "enable_gpu": acc_spec.enable_gpu,
-        "enable_tpu": acc_spec.enable_tpu,
-        "enable_internet": bool(enable_internet),
-        "dataset_sources": all_datasets,
-        "competition_sources": comp_list,
-        "kernel_sources": [],
-        "model_sources": model_list,
-    }
-    if acc_spec.machine_shape:
-        kernel_meta["machine_shape"] = acc_spec.machine_shape
+        kernel_meta: dict[str, Any] = {
+            "id": kernel_ref,
+            "title": kernel_slug,
+            "code_file": "offline_runner.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": True,
+            "enable_gpu": acc_spec.enable_gpu,
+            "enable_tpu": acc_spec.enable_tpu,
+            "enable_internet": bool(enable_internet),
+            "dataset_sources": all_datasets,
+            "competition_sources": comp_list,
+            "kernel_sources": [],
+            "model_sources": model_list,
+        }
+        if acc_spec.machine_shape:
+            kernel_meta["machine_shape"] = acc_spec.machine_shape
 
-    (bundle_dir / "kernel-metadata.json").write_text(
-        json.dumps(kernel_meta, indent=2),
-        encoding="utf-8",
-    )
+        (bundle_dir / "kernel-metadata.json").write_text(
+            json.dumps(kernel_meta, indent=2),
+            encoding="utf-8",
+        )
 
-    with protect_stdout():
-        push_resp = api.kernels_push(str(bundle_dir), acc=acc_spec.machine_shape)
-    version_number = validate_push_response(push_resp)
+        with protect_stdout():
+            push_resp = api.kernels_push(str(bundle_dir), acc=acc_spec.machine_shape)
+        version_number = validate_push_response(push_resp)
+    finally:
+        shutil.rmtree(bundle_dir, ignore_errors=True)
 
     sess = ActiveSession(
-        session_id=f"batch_{secrets.token_hex(8)}",
+        session_id=f"batch_{run_id}_{secrets.token_hex(4)}",
         kernel_ref=kernel_ref,
         created_at=time.time(),
         slot=s,
@@ -387,6 +481,7 @@ def submit_offline_batch(
         version_number=version_number,
         competition=",".join(comp_list),
         enable_internet=bool(enable_internet),
+        status="ready",
     )
     save_active_session(sess, slot=s)
     record_local_activity(
@@ -429,6 +524,27 @@ def _extract_event_text(ev: Any) -> str:
         except Exception:
             pass
     return raw
+
+
+def _close_stream_resources(stream_iter: Any, reader_alive: bool) -> None:
+    """Close underlying HTTP response socket even if generator is blocked on iter_lines()."""
+    frame = getattr(stream_iter, "gi_frame", None)
+    if frame is not None:
+        for obj in list(frame.f_locals.values()):
+            close_resp = getattr(obj, "close", None)
+            if callable(close_resp) and obj is not stream_iter:
+                try:
+                    close_resp()
+                except Exception:
+                    pass
+    is_running_gen = bool(getattr(stream_iter, "gi_running", False))
+    if not is_running_gen or not reader_alive:
+        close_fn = getattr(stream_iter, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
 
 
 def collect_stream_window(
@@ -480,14 +596,37 @@ def collect_stream_window(
             chunks.append(_extract_event_text(payload))
     finally:
         stop_flag.set()
-        close_fn = getattr(stream_iter, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:
-                pass
+        _close_stream_resources(stream_iter, reader_alive=t.is_alive())
+        t.join(timeout=0.05)
+        if not t.is_alive():
+            _close_stream_resources(stream_iter, reader_alive=False)
 
     return "".join(chunks), reached_eof
+
+
+def merge_sse_log_snapshot(existing: str, incoming: str) -> str:
+    """Merge cumulative or delta Host-SSE log chunks without $O(N^2)$ epoch duplication."""
+    if not incoming:
+        return existing
+    if not existing or incoming.startswith(existing):
+        return incoming
+    if existing.endswith(incoming) or incoming in existing:
+        return existing
+
+    # Stitch longest suffix of `existing` matching a prefix of `incoming`
+    max_overlap = min(len(existing), len(incoming), 65536)
+    tail = existing[-max_overlap:]
+    seed = incoming[: min(8, len(incoming))]
+    pos = tail.find(seed)
+    while pos != -1:
+        overlap = len(tail) - pos
+        if incoming.startswith(tail[pos:]):
+            return existing + incoming[overlap:]
+        pos = tail.find(seed, pos + 1)
+    for overlap in range(min(len(seed) - 1, len(tail)), 0, -1):
+        if tail.endswith(incoming[:overlap]):
+            return existing + incoming[overlap:]
+    return existing + incoming
 
 
 def read_batch_logs_windowed(
@@ -536,6 +675,7 @@ def read_batch_logs_windowed(
                 note = f"logs_error ({exc})"
 
     # Cache cumulative snapshots locally per slot/version so SSE deltas aren't lost across calls
+    ensure_secure_state_dir(STATE_DIR)
     cache_dir = STATE_DIR / "batch_logs"
     cache_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", versioned_ref)
@@ -546,14 +686,18 @@ def read_batch_logs_windowed(
             cache_file.write_text(raw_log, encoding="utf-8")
         else:
             existing_txt = cache_file.read_text(encoding="utf-8") if cache_file.is_file() else ""
-            if raw_log not in existing_txt:
-                cache_file.write_text(existing_txt + raw_log, encoding="utf-8")
+            merged = merge_sse_log_snapshot(existing_txt, raw_log)
+            if merged != existing_txt:
+                cache_file.write_text(merged, encoding="utf-8")
 
     full_text = cache_file.read_text(encoding="utf-8") if cache_file.is_file() else raw_log
     cleaned = clean_log_text(full_text)
     lines = cleaned.splitlines()
     if grep:
-        pat = re.compile(grep, re.IGNORECASE)
+        try:
+            pat = re.compile(grep, re.IGNORECASE)
+        except re.error:
+            pat = re.compile(re.escape(grep), re.IGNORECASE)
         lines = [ln for ln in lines if pat.search(ln)]
     tail = lines[-max(1, int(tail_lines)) :]
 

@@ -8,11 +8,9 @@ import json
 import sys
 from typing import Any
 
-from .activity import record_local_activity
 from .batch import read_batch_logs_windowed
 from .client import WorkerClient, WorkerSessionStoppedError
 from .config import (
-    clear_active_session,
     load_active_session,
     load_settings,
     normalize_slot,
@@ -25,7 +23,7 @@ from .kaggle_hub import (
     search_kaggle_hub,
     submit_competition_file,
 )
-from .launcher import launch_workers_multi, normalize_str_list
+from .launcher import launch_workers_multi, normalize_str_list, shutdown_slot
 from .quota import fetch_quota_summary
 
 
@@ -65,17 +63,8 @@ def dispatch_bridge_action(action: str, payload: dict[str, Any]) -> Any:
 
     if act == "down":
         slot = normalize_slot(str(payload.get("slot") or "1"))
-        sess = load_active_session(slot)
-        out: dict[str, Any] = {"slot": slot, "shutdown_sent": False}
-        if not sess or sess.mode == "live":
-            try:
-                out["worker_response"] = WorkerClient(settings, slot=slot, caller="tui").shutdown()
-                out["shutdown_sent"] = True
-            except Exception as exc:
-                out["shutdown_note"] = str(exc)
-        clear_active_session(slot)
-        record_local_activity(slot, "tui", "shutdown", f"Slot '{slot}' shut down from Rust TUI")
-        return out
+        force = bool(payload.get("force", False))
+        return shutdown_slot(settings, slot, force=force, caller="tui")
 
     if act == "hub_search":
         return search_kaggle_hub(

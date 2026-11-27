@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from . import config
@@ -20,6 +21,26 @@ _FLOW_MAX_BYTES = 128 * 1024
 _FLOW_KEEP_LINES = 120
 
 
+def _append_secure_jsonl(target_file: Path, line: str, max_bytes: int, keep_lines: int) -> None:
+    import os
+
+    config.ensure_secure_state_dir(target_file.parent)
+    data = line.encode("utf-8")
+    if os.name != "nt":
+        fd = os.open(str(target_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    else:
+        with open(target_file, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    if target_file.stat().st_size > max_bytes:
+        lines = target_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        trimmed = "\n".join(lines[-keep_lines:]) + "\n"
+        config.write_secure_atomic(target_file, trimmed)
+
+
 def record_local_activity(
     slot: str,
     caller: str,
@@ -29,9 +50,7 @@ def record_local_activity(
 ) -> None:
     """Append a local lifecycle event (e.g. booting, tunnel ready, batch submitted, down)."""
     try:
-        state_dir = config.STATE_DIR
-        state_dir.mkdir(parents=True, exist_ok=True)
-        act_file = state_dir / "activity.jsonl"
+        act_file = config.STATE_DIR / "activity.jsonl"
         entry = {
             "ts": round(time.time(), 3),
             "slot": str(slot or "1"),
@@ -42,12 +61,7 @@ def record_local_activity(
         }
         line = json.dumps(entry, ensure_ascii=False) + "\n"
         with _ACT_LOCK:
-            with open(act_file, "a", encoding="utf-8") as fh:
-                fh.write(line)
-            if act_file.stat().st_size > _MAX_BYTES:
-                lines = act_file.read_text(encoding="utf-8", errors="replace").splitlines()
-                trimmed = "\n".join(lines[-_KEEP_LINES:]) + "\n"
-                act_file.write_text(trimmed, encoding="utf-8")
+            _append_secure_jsonl(act_file, line, _MAX_BYTES, _KEEP_LINES)
     except Exception:
         pass
 
@@ -114,11 +128,7 @@ def record_mcp_flow_event(
             entry["error"] = error[:200]
         line = json.dumps(entry, ensure_ascii=False) + "\n"
         with _FLOW_LOCK:
-            with open(flow_file, "a", encoding="utf-8") as fh:
-                fh.write(line)
-            if flow_file.stat().st_size > _FLOW_MAX_BYTES:
-                lines = flow_file.read_text(encoding="utf-8", errors="replace").splitlines()
-                flow_file.write_text("\n".join(lines[-_FLOW_KEEP_LINES:]) + "\n", encoding="utf-8")
+            _append_secure_jsonl(flow_file, line, _FLOW_MAX_BYTES, _FLOW_KEEP_LINES)
     except Exception:
         pass
 

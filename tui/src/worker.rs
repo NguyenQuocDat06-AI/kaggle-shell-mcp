@@ -12,13 +12,16 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tar::{Archive, Builder, EntryType};
 
 use crate::state::{ActiveSession, ActivityEvent};
 
 static HTML_TAG_RE: OnceLock<Regex> = OnceLock::new();
+static IDEM_SEQ: AtomicU64 = AtomicU64::new(1);
+const MAX_TAR_EXTRACT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB Tar Bomb cap
 
 pub fn summarize_http_error(slot: &str, status: u16, raw_body: &str) -> String {
     let body = raw_body.trim();
@@ -28,6 +31,12 @@ pub fn summarize_http_error(slot: &str, status: u16, raw_body: &str) -> String {
         return format!(
             "Worker [slot={}] tunnel closed (HTTP {} — VM stopped or tunnel offline).",
             slot, status
+        );
+    }
+    if status == 524 {
+        return format!(
+            "Worker [slot={}] HTTP 524: Cloudflare 100s timeout exceeded (use detached Job for long runs).",
+            slot
         );
     }
     if (status == 502 || status == 504) && is_html {
@@ -182,6 +191,7 @@ pub struct MonitorPayload {
     pub events: Vec<ActivityEvent>,
     pub log_chunk: Option<LogChunk>,
     pub pty_live: Option<PtyLive>,
+    pub pty_sessions_live: BTreeMap<String, PtyLive>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -209,6 +219,7 @@ pub struct FsReadText {
     pub path: String,
     pub size_bytes: u64,
     pub truncated: bool,
+    pub is_binary: bool,
     pub content: String,
 }
 
@@ -329,12 +340,27 @@ impl WorkerHttpClient {
             )));
         }
         let url = format!("{}{}", base, path);
+        let is_readonly_post = matches!(
+            path,
+            "/monitor" | "/fs/list" | "/fs/read_text" | "/fs/du" | "/fs/inspect" | "/fs/find"
+        );
         let mut req = self
             .http
-            .request(method, &url)
+            .request(method.clone(), &url)
             .header(AUTHORIZATION, format!("Bearer {}", sess.worker_token))
             .header("X-Kgsh-Caller", "tui")
             .timeout(Duration::from_secs(timeout_sec));
+        if method == reqwest::Method::POST && !is_readonly_post {
+            let ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = IDEM_SEQ.fetch_add(1, Ordering::Relaxed);
+            req = req.header(
+                "X-Idempotency-Key",
+                format!("tui-{}-{}-{}", std::process::id(), ns, seq),
+            );
+        }
 
         for (k, v) in extra_headers {
             req = req.header(*k, *v);
@@ -454,6 +480,7 @@ impl WorkerHttpClient {
                         events: vec![],
                         log_chunk: None,
                         pty_live: None,
+                        pty_sessions_live: BTreeMap::new(),
                     },
                     t0.elapsed().as_secs_f64() * 1000.0,
                 ))
@@ -586,7 +613,8 @@ impl WorkerHttpClient {
                 Ok(FsReadText {
                     path: remote_path.to_string(),
                     size_bytes: res.output.len() as u64,
-                    truncated: false,
+                    truncated: res.output.len() >= max_bytes,
+                    is_binary: res.output.as_bytes().contains(&0),
                     content: res.output,
                 })
             }
@@ -599,12 +627,17 @@ impl WorkerHttpClient {
         sess: &ActiveSession,
         remote_path: &str,
         content: &str,
+        allow_overwrite_large: bool,
     ) -> std::result::Result<Value, WorkerError> {
         match self
             .post_json(
                 sess,
                 "/fs/write_text",
-                json!({ "path": remote_path, "content": content }),
+                json!({
+                    "path": remote_path,
+                    "content": content,
+                    "allow_overwrite_large": allow_overwrite_large,
+                }),
                 30,
             )
             .await
@@ -614,10 +647,10 @@ impl WorkerHttpClient {
                 let b64 = b64_encode(content.as_bytes());
                 let p_json = serde_json::to_string(remote_path).unwrap_or_default();
                 let py = format!(
-                    "python3 -c \"import base64,pathlib; p=pathlib.Path({}); p.parent.mkdir(parents=True,exist_ok=True); d=base64.b64decode('{}'); p.write_bytes(d); print(len(d))\"",
+                    "python3 -c \"import base64,pathlib; p=pathlib.Path({}).resolve(); assert (str(p).startswith('/kaggle/working/') or str(p).startswith('/tmp/')) and not str(p).startswith('/tmp/kaggle_mcp_runtime'), 'Unsafe path'; p.parent.mkdir(parents=True,exist_ok=True); d=base64.b64decode('{}'); p.write_bytes(d); print(len(d))\"",
                     p_json, b64
                 );
-                let res = self.term_exec(sess, &py, "default", 30.0).await?;
+                let res = self.term_exec(sess, &py, "tui", 30.0).await?;
                 if res.exit_code != 0 {
                     return Err(WorkerError::Other(format!("Write failed: {}", res.output)));
                 }
@@ -638,9 +671,12 @@ impl WorkerHttpClient {
         {
             Ok(v) => Ok(v),
             Err(e) if e.is_404() => {
-                let res = self
-                    .term_exec(sess, &format!("mkdir -p {}", sh_quote(remote_path)), "default", 15.0)
-                    .await?;
+                let p_json = serde_json::to_string(remote_path).unwrap_or_default();
+                let py = format!(
+                    "python3 -c \"import pathlib; p=pathlib.Path({}).resolve(); assert (str(p).startswith('/kaggle/working/') or str(p).startswith('/tmp/')) and not str(p).startswith('/tmp/kaggle_mcp_runtime'), 'Unsafe path'; p.mkdir(parents=True,exist_ok=True)\"",
+                    p_json
+                );
+                let res = self.term_exec(sess, &py, "tui", 15.0).await?;
                 if res.exit_code != 0 {
                     return Err(WorkerError::Other(res.output));
                 }
@@ -1014,6 +1050,32 @@ impl WorkerHttpClient {
     }
 }
 
+pub fn is_secret_tar_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let low = name.to_ascii_lowercase();
+    if matches!(low.as_str(), ".env.example" | ".env.sample" | ".env.template") {
+        return false;
+    }
+    if matches!(
+        low.as_str(),
+        ".env" | "kaggle.json" | "access_token" | ".netrc" | "id_rsa" | "id_ed25519"
+    ) {
+        return true;
+    }
+    if low.starts_with(".env.") {
+        return true;
+    }
+    if [".pem", ".key", ".p12", ".pfx"]
+        .iter()
+        .any(|suf| low.ends_with(suf))
+    {
+        return true;
+    }
+    false
+}
+
 fn should_skip_tar(path: &Path) -> bool {
     let ignore_dirs: HashSet<&str> = [
         ".git",
@@ -1025,6 +1087,10 @@ fn should_skip_tar(path: &Path) -> bool {
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
+        "kaggle_pull",
+        "kaggle_outputs",
+        "kaggle_downloads",
+        "wandb",
         "target",
     ]
     .into_iter()
@@ -1037,15 +1103,21 @@ fn should_skip_tar(path: &Path) -> bool {
             return true;
         }
     }
-    false
+    is_secret_tar_file(path)
 }
 
 pub fn pack_tar_gz(local_path: &Path) -> Result<Vec<u8>> {
     let abs = std::fs::canonicalize(local_path)
         .with_context(|| format!("Local path not found: {:?}", local_path))?;
+    if abs.is_file() && is_secret_tar_file(&abs) {
+        bail!(
+            "Refused to upload credential file {:?} by default to prevent secret leakage.",
+            abs.file_name().unwrap_or_default()
+        );
+    }
     let mut buf = Vec::new();
     {
-        let enc = GzEncoder::new(&mut buf, Compression::default());
+        let enc = GzEncoder::new(&mut buf, Compression::fast());
         let mut tar = Builder::new(enc);
         let top_name = abs
             .file_name()
@@ -1062,6 +1134,10 @@ pub fn pack_tar_gz(local_path: &Path) -> Result<Vec<u8>> {
             ) -> Result<()> {
                 for entry in std::fs::read_dir(cur)? {
                     let entry = entry?;
+                    let ft = entry.file_type()?;
+                    if ft.is_symlink() {
+                        continue;
+                    }
                     let p = entry.path();
                     if should_skip_tar(&p) {
                         continue;
@@ -1071,10 +1147,10 @@ pub fn pack_tar_gz(local_path: &Path) -> Result<Vec<u8>> {
                         .join(rel)
                         .to_string_lossy()
                         .replace('\\', "/");
-                    if p.is_dir() {
+                    if ft.is_dir() {
                         tar.append_dir(&arc, &p)?;
                         walk_dir(tar, root, &p, base_arc)?;
-                    } else if p.is_file() {
+                    } else if ft.is_file() {
                         tar.append_path_with_name(&p, &arc)?;
                     }
                 }
@@ -1089,12 +1165,45 @@ pub fn pack_tar_gz(local_path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn ensure_no_symlink_components(canonical_dest: &Path, rel: &Path) -> Result<PathBuf> {
+    let mut cur = canonical_dest.to_path_buf();
+    let comps: Vec<Component> = rel.components().collect();
+    for (idx, comp) in comps.iter().enumerate() {
+        match comp {
+            Component::Normal(part) => {
+                cur.push(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+                    if meta.file_type().is_symlink() {
+                        bail!("Blocked extraction through existing symlink: {:?}", cur);
+                    }
+                } else if idx + 1 < comps.len() {
+                    // Parent dir doesn't exist yet; safe to create later
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("Blocked path traversal in tar archive: {:?}", rel);
+            }
+        }
+    }
+    Ok(cur)
+}
+
 pub fn unpack_tar_gz_safe(tar_bytes: &[u8], dest_dir: &Path) -> Result<Vec<String>> {
+    unpack_tar_gz_safe_with_limit(tar_bytes, dest_dir, MAX_TAR_EXTRACT_BYTES)
+}
+
+pub fn unpack_tar_gz_safe_with_limit(
+    tar_bytes: &[u8],
+    dest_dir: &Path,
+    max_bytes: u64,
+) -> Result<Vec<String>> {
     std::fs::create_dir_all(dest_dir)?;
     let canonical_dest = std::fs::canonicalize(dest_dir)?;
     let dec = GzDecoder::new(Cursor::new(tar_bytes));
     let mut archive = Archive::new(dec);
     let mut extracted = Vec::new();
+    let mut total_written: u64 = 0;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -1110,16 +1219,32 @@ pub fn unpack_tar_gz_safe(tar_bytes: &[u8], dest_dir: &Path) -> Result<Vec<Strin
         {
             bail!("Blocked path traversal in tar archive: {:?}", rel);
         }
-        let out_path = canonical_dest.join(&rel);
+        let out_path = ensure_no_symlink_components(&canonical_dest, &rel)?;
         if etype == EntryType::Directory {
             std::fs::create_dir_all(&out_path)?;
         } else if etype == EntryType::Regular {
+            let remaining = max_bytes.saturating_sub(total_written);
+            if entry.size() > remaining {
+                bail!(
+                    "Archive exceeds maximum safe extraction limit ({} bytes)",
+                    max_bytes
+                );
+            }
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data)?;
-            std::fs::write(&out_path, &data)?;
+            let mut out_file = std::fs::File::create(&out_path)?;
+            let mut limited = (&mut entry).take(remaining.saturating_add(1));
+            let written = std::io::copy(&mut limited, &mut out_file)?;
+            total_written = total_written.saturating_add(written);
+            if total_written > max_bytes {
+                drop(out_file);
+                let _ = std::fs::remove_file(&out_path);
+                bail!(
+                    "Archive exceeds maximum safe extraction limit ({} bytes)",
+                    max_bytes
+                );
+            }
         }
         extracted.push(rel.to_string_lossy().replace('\\', "/"));
     }
@@ -1130,7 +1255,7 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
-fn b64_encode(input: &[u8]) -> String {
+pub fn b64_encode(input: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -1214,6 +1339,47 @@ mod tests {
             enc.finish().unwrap();
         }
         assert!(unpack_tar_gz_safe(&bad_tar, &dir.join("out2")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pack_tar_gz_filters_secrets_and_unpack_enforces_size_limit() {
+        let dir = std::env::temp_dir().join(format!("kgsh_sec_tar_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("kaggle_pull")).unwrap();
+        std::fs::write(proj.join("train.py"), b"print(1)\n").unwrap();
+        std::fs::write(proj.join(".env"), b"KAGGLE_API_TOKEN=secret\n").unwrap();
+        std::fs::write(proj.join(".env.prod"), b"HF_TOKEN=secret\n").unwrap();
+        std::fs::write(proj.join(".env.example"), b"KAGGLE_API_TOKEN=\n").unwrap();
+        std::fs::write(proj.join("kaggle.json"), b"{}").unwrap();
+        std::fs::write(proj.join("priv.pem"), b"KEY").unwrap();
+        std::fs::write(proj.join("kaggle_pull").join("old.bin"), b"123456").unwrap();
+
+        // Standalone secret file upload refused
+        assert!(pack_tar_gz(&proj.join(".env")).is_err());
+
+        let archive = pack_tar_gz(&proj).unwrap();
+        let out = dir.join("extracted");
+        unpack_tar_gz_safe(&archive, &out).unwrap();
+        assert!(out.join("proj").join("train.py").is_file());
+        assert!(out.join("proj").join(".env.example").is_file());
+        assert!(!out.join("proj").join(".env").exists());
+        assert!(!out.join("proj").join(".env.prod").exists());
+        assert!(!out.join("proj").join("kaggle.json").exists());
+        assert!(!out.join("proj").join("priv.pem").exists());
+        assert!(!out.join("proj").join("kaggle_pull").exists());
+
+        // Tar Bomb size ceiling enforced
+        let big_src = dir.join("big.bin");
+        std::fs::write(&big_src, vec![b'X'; 1024]).unwrap();
+        let big_tar = pack_tar_gz(&big_src).unwrap();
+        assert!(unpack_tar_gz_safe_with_limit(&big_tar, &dir.join("bomb"), 128).is_err());
+
+        // HTTP 524 Cloudflare timeout summarized cleanly
+        let msg524 = summarize_http_error("1", 524, "<html>524 A Timeout Occurred</html>");
+        assert!(msg524.contains("HTTP 524"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

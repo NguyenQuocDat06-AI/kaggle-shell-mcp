@@ -747,7 +747,18 @@ pub enum AppMsg {
         entries: Vec<FsEntry>,
     },
     PreviewDrawerLoaded(PreviewDrawerState),
-    FsReadDone(String, String),
+    FsReadDone {
+        path: String,
+        content: String,
+        truncated: bool,
+        is_binary: bool,
+        size_bytes: u64,
+    },
+    FsSaveDone {
+        path: String,
+        ok: bool,
+        err: String,
+    },
     FsInspectDone(InspectResult),
     FsDuDone {
         side: Side,

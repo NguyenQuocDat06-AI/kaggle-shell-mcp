@@ -2,8 +2,10 @@
 .venv/
 .kaggle_mcp/
 kaggle_downloads/
+kaggle_outputs/
 kaggle_pull/
 ROADMAP.md
+docs/evaluation/
 __pycache__/
 *.py[cod]
 build/

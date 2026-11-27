@@ -90,9 +90,17 @@ fn render_list_modal(
 ) {
     let inner = modal_box(f, rects, area, title);
     rects.modal_list_rect = inner;
+    let view_h = inner.height.max(1) as usize;
+    let scroll = if selected >= view_h {
+        selected + 1 - view_h
+    } else {
+        0
+    };
     let lines: Vec<Line> = labels
         .into_iter()
         .enumerate()
+        .skip(scroll)
+        .take(view_h)
         .map(|(i, lbl)| {
             let st = if i == selected {
                 Style::default().bg(SEL_BG).fg(Color::White).add_modifier(Modifier::BOLD)
@@ -257,10 +265,18 @@ fn render_sync_modal(f: &mut Frame, rects: &mut UiRects, m: &SyncModalState, are
 
 fn render_editor_modal(f: &mut Frame, rects: &mut UiRects, m: &EditorModalState, area: Rect) {
     let scope = if m.is_local { "Local" } else { "Remote" };
-    let title = if m.is_new {
-        format!("New {} File", scope)
+    let dirty_mark = if m.dirty { " *" } else { "" };
+    let base_title = if m.is_new {
+        format!("New {} File{}", scope, dirty_mark)
     } else {
-        format!("{} File Editor", scope)
+        format!("{} File Editor{}", scope, dirty_mark)
+    };
+    let title = if m.saving {
+        format!("{} · Saving...", base_title)
+    } else if !m.readonly_reason.is_empty() {
+        format!("{} · {}", base_title, m.readonly_reason)
+    } else {
+        base_title
     };
     let inner = modal_box(f, rects, area, &title);
     let chunks = Layout::default()
@@ -330,11 +346,18 @@ fn render_editor_modal(f: &mut Frame, rects: &mut UiRects, m: &EditorModalState,
     }
 
     let hint = if m.readonly {
-        " Read-Only · Shift/Drag Select · ^A All · ^C Copy · Esc Close"
+        if m.readonly_reason.is_empty() {
+            " Read-Only · Shift/Drag Select · ^A All · ^C Copy · Esc Close".to_string()
+        } else {
+            format!(" {} · ^A All · ^C Copy · Esc Close", m.readonly_reason)
+        }
+    } else if m.confirm_discard {
+        " [UNSAVED CHANGES] Press Esc again to discard, or ^S to save".to_string()
     } else {
-        " Shift/Drag Select · ^A All · ^C Copy · ^X Cut · ^V Paste · ^S Save · Esc Close"
+        " Shift/Drag Select · Tab Indent · ^A All · ^C Copy · ^X Cut · ^V Paste · ^S Save · Esc Close".to_string()
     };
-    f.render_widget(Paragraph::new(hint).style(Style::default().fg(MUTED)), chunks[2]);
+    let hint_col = if m.confirm_discard { WARN } else { MUTED };
+    f.render_widget(Paragraph::new(hint).style(Style::default().fg(hint_col)), chunks[2]);
 }
 
 fn render_path_action_modal(f: &mut Frame, rects: &mut UiRects, m: &PathActionModalState, area: Rect) {
@@ -445,9 +468,17 @@ fn render_palette_modal(f: &mut Frame, rects: &mut UiRects, m: &PaletteModalStat
     f.render_widget(Paragraph::new(field_line_tf("Search", &m.query, true)), chunks[0]);
     rects.modal_list_rect = chunks[1];
     let items = filtered_palette_items(&m.query.value);
+    let view_h = chunks[1].height.max(1) as usize;
+    let scroll = if m.selected >= view_h {
+        m.selected + 1 - view_h
+    } else {
+        0
+    };
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
+        .skip(scroll)
+        .take(view_h)
         .map(|(i, (title, help, _))| {
             let st = if i == m.selected { Style::default().bg(SEL_BG).fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(TEXT) };
             Line::from(vec![Span::styled(format!("{}  ", title), st), Span::styled(*help, Style::default().fg(MUTED))])
@@ -511,6 +542,9 @@ fn render_help_modal(f: &mut Frame, rects: &mut UiRects, active: &PaneKind, area
         let st = if idx == 0 { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(TEXT) };
         lines.push(Line::from(Span::styled(ln, st)));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines.into_iter().take(inner.height.max(1) as usize).collect::<Vec<_>>()),
+        inner,
+    );
 }
 

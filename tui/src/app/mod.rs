@@ -1,7 +1,7 @@
 //! Universal Dual-Panel Workbench (`LEFT | RIGHT`) with Yazi/TermSCP-inspired File UX, `NAV`/`INPUT` modes & Context Actions.
 
 use ratatui::layout::Rect;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -109,6 +109,10 @@ pub struct App {
     pub hub_delete_arm: Option<(String, Instant)>,
 
     // Guards & Timers
+    pub yank_buffer: String,
+    #[cfg(not(test))]
+    pub clipboard: Option<arboard::Clipboard>,
+    pub poll_in_flight: HashSet<String>,
     pub delete_arm: Option<(String, Instant)>,
     pub poll_fail_count: u32,
     pub poll_backoff_until: Option<Instant>,
@@ -122,9 +126,10 @@ impl App {
     pub fn new(
         state_dir: PathBuf,
         initial_slot: String,
-        bridge: PythonBridge,
+        mut bridge: PythonBridge,
         tx: UnboundedSender<AppMsg>,
     ) -> Self {
+        bridge.state_dir = state_dir.clone();
         let sessions = load_all_sessions(&state_dir);
         let mut app = Self {
             state_dir: state_dir.clone(),
@@ -196,6 +201,10 @@ impl App {
             hub_detail: None,
             hub_detail_scroll: 0,
             hub_delete_arm: None,
+            yank_buffer: String::new(),
+            #[cfg(not(test))]
+            clipboard: None,
+            poll_in_flight: HashSet::new(),
             delete_arm: None,
             poll_fail_count: 0,
             poll_backoff_until: None,
@@ -512,6 +521,7 @@ impl App {
                 self.end_task(tid);
             }
             AppMsg::MonitorOk { slot, payload, rtt_ms } => {
+                self.poll_in_flight.remove(&slot);
                 if slot != self.current_slot {
                     return;
                 }
@@ -578,7 +588,13 @@ impl App {
                     }
                 }
 
-                if let Some(pl) = payload.pty_live {
+                let fallback_live = if payload.pty_sessions_live.is_empty() {
+                    payload.pty_live
+                } else {
+                    None
+                };
+                let tui_live = payload.pty_sessions_live.get("tui").cloned().or(fallback_live);
+                if let Some(pl) = tui_live {
                     if pl.running {
                         let started = self
                             .running_exec
@@ -606,6 +622,7 @@ impl App {
                 }
             }
             AppMsg::MonitorErr { slot, tunnel_down, message } => {
+                self.poll_in_flight.remove(&slot);
                 if slot != self.current_slot {
                     return;
                 }
@@ -631,6 +648,7 @@ impl App {
                 }
             }
             AppMsg::BatchLogsDone { slot, status, logs } => {
+                self.poll_in_flight.remove(&slot);
                 if slot != self.current_slot {
                     return;
                 }
@@ -702,8 +720,28 @@ impl App {
             AppMsg::PreviewDrawerLoaded(drawer) => {
                 self.preview_drawer = Some(drawer);
             }
-            AppMsg::FsReadDone(path, content) => {
-                let readonly = path.starts_with("/kaggle/input");
+            AppMsg::FsReadDone {
+                path,
+                content,
+                truncated,
+                is_binary,
+                size_bytes,
+            } => {
+                let (readonly, readonly_reason) = if path.starts_with("/kaggle/input") {
+                    (true, "Read-Only (/kaggle/input)".to_string())
+                } else if is_binary {
+                    (true, format!("Read-Only (binary · {})", fmt_bytes(size_bytes)))
+                } else if truncated {
+                    (
+                        true,
+                        format!(
+                            "Read-Only (truncated > 256 KB of {} — pull locally to edit)",
+                            fmt_bytes(size_bytes)
+                        ),
+                    )
+                } else {
+                    (false, String::new())
+                };
                 let lines: Vec<String> = if content.is_empty() {
                     vec![String::new()]
                 } else {
@@ -714,13 +752,29 @@ impl App {
                     is_new: false,
                     path: TextField::new(path),
                     lines,
-                    cur_row: 0,
-                    cur_col: 0,
-                    sel_anchor: None,
-                    scroll_row: 0,
                     readonly,
-                    focus_path: false,
+                    readonly_reason,
+                    ..Default::default()
                 }));
+            }
+            AppMsg::FsSaveDone { path, ok, err } => {
+                if ok {
+                    if let Some(Modal::FileEditor(ref mut m)) = self.modal {
+                        if m.path.value.trim() == path {
+                            m.saving = false;
+                            m.dirty = false;
+                            m.confirm_discard = false;
+                            m.is_new = false;
+                        }
+                    }
+                    self.notify(format!("Saved {}", path), false);
+                    self.refresh_all_remote_panes();
+                } else {
+                    if let Some(Modal::FileEditor(ref mut m)) = self.modal {
+                        m.saving = false;
+                    }
+                    self.notify(format!("Save failed: {}", err), true);
+                }
             }
             AppMsg::FsInspectDone(info) => {
                 self.modal = Some(Modal::SmartInspect(SmartInspectModalState { info, scroll: 0 }));
@@ -884,12 +938,8 @@ impl App {
                 is_new: true,
                 path: TextField::new(new_path),
                 lines: vec![String::new()],
-                cur_row: 0,
-                cur_col: 0,
-                sel_anchor: None,
-                scroll_row: 0,
-                readonly: false,
                 focus_path: true,
+                ..Default::default()
             }));
             return;
         }
@@ -904,12 +954,8 @@ impl App {
             is_new: true,
             path: TextField::new(format!("{}/untitled.py", base_dir.trim_end_matches('/'))),
             lines: vec![String::new()],
-            cur_row: 0,
-            cur_col: 0,
-            sel_anchor: None,
-            scroll_row: 0,
-            readonly: false,
             focus_path: true,
+            ..Default::default()
         }));
     }
 
@@ -1040,6 +1086,7 @@ impl App {
         self.raw_log_lines.clear();
         self.jobs.clear();
         self.gpu_procs.clear();
+        self.poll_in_flight.clear();
         self.poll_fail_count = 0;
         self.poll_backoff_until = None;
         self.known_cwd = "/kaggle/working".into();
@@ -1062,7 +1109,51 @@ impl App {
         self.staged_competition.clone()
     }
 
+    pub fn set_clipboard_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.yank_buffer = text.to_string();
+        let osc52 = build_osc52_sequence(text);
+        #[cfg(test)]
+        let _ = (osc52, std::any::TypeId::of::<arboard::Clipboard>());
+        #[cfg(not(test))]
+        {
+            if let Some(seq) = osc52 {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(seq.as_bytes());
+                let _ = out.flush();
+            }
+            if self.clipboard.is_none() {
+                self.clipboard = arboard::Clipboard::new().ok();
+            }
+            if let Some(ref mut cb) = self.clipboard {
+                let _ = cb.set_text(text.to_string());
+            }
+        }
+    }
 
+    pub fn get_clipboard_text(&mut self) -> Option<String> {
+        #[cfg(not(test))]
+        {
+            if self.clipboard.is_none() {
+                self.clipboard = arboard::Clipboard::new().ok();
+            }
+            if let Some(ref mut cb) = self.clipboard {
+                if let Ok(txt) = cb.get_text() {
+                    if !txt.is_empty() {
+                        return Some(txt);
+                    }
+                }
+            }
+        }
+        if self.yank_buffer.is_empty() {
+            None
+        } else {
+            Some(self.yank_buffer.clone())
+        }
+    }
 }
 
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -1163,14 +1254,31 @@ pub fn filtered_palette_items(query: &str) -> Vec<(&'static str, &'static str, &
         .collect()
 }
 
-pub fn copy_clipboard(text: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text.to_string());
+pub fn build_osc52_sequence(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
     }
+    let b64 = crate::worker::b64_encode(text.as_bytes());
+    if b64.is_empty() || b64.len() > 65536 {
+        return None;
+    }
+    if !b64
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return None;
+    }
+    Some(format!("\x1b]52;c;{}\x07", b64))
 }
 
+#[cfg(not(test))]
 pub fn paste_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+#[cfg(test)]
+pub fn paste_clipboard() -> Option<String> {
+    None
 }
 
 pub fn fmt_bytes(b: u64) -> String {

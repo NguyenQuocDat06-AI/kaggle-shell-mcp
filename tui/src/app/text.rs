@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::paste_clipboard;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TextField {
     pub value: String,
     pub cursor: usize,
@@ -212,7 +212,11 @@ pub(super) enum TextFieldKeyOutcome {
     Cut(String),
 }
 
-pub(super) fn apply_text_field_key(tf: &mut TextField, key: KeyEvent) -> TextFieldKeyOutcome {
+pub(super) fn apply_text_field_key(
+    tf: &mut TextField,
+    key: KeyEvent,
+    fallback_yank: &str,
+) -> TextFieldKeyOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
@@ -238,7 +242,14 @@ pub(super) fn apply_text_field_key(tf: &mut TextField, key: KeyEvent) -> TextFie
             }
         }
         KeyCode::Char('v' | 'V') if ctrl => {
-            if let Some(clip) = paste_clipboard() {
+            let clip_opt = paste_clipboard().filter(|s| !s.is_empty()).or_else(|| {
+                if fallback_yank.is_empty() {
+                    None
+                } else {
+                    Some(fallback_yank.to_string())
+                }
+            });
+            if let Some(clip) = clip_opt {
                 let clean: String = clip.replace("\r\n", "\n").lines().collect::<Vec<_>>().join(" ");
                 tf.insert_str(&clean);
                 TextFieldKeyOutcome::Changed
@@ -293,7 +304,7 @@ pub(super) fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EditorModalState {
     pub is_local: bool,
     pub is_new: bool,
@@ -305,6 +316,10 @@ pub struct EditorModalState {
     pub scroll_row: usize,
     pub readonly: bool,
     pub focus_path: bool,
+    pub dirty: bool,
+    pub confirm_discard: bool,
+    pub saving: bool,
+    pub readonly_reason: String,
 }
 
 impl EditorModalState {

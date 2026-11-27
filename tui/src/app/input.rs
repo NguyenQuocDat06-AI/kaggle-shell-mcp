@@ -214,7 +214,8 @@ impl App {
                     self.input_focus = InputFocus::None;
                     return;
                 }
-                match apply_text_field_key(&mut self.log_filter, key) {
+                let yank = self.yank_buffer.clone();
+                match apply_text_field_key(&mut self.log_filter, key, &yank) {
                     TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                         self.notify_copied_text(&t);
                     }
@@ -227,8 +228,9 @@ impl App {
                     self.input_focus = InputFocus::None;
                     return;
                 }
+                let yank = self.yank_buffer.clone();
                 let outcome = match self.pane_mut(side) {
-                    PaneKind::LocalFiles(ref mut lp) => apply_text_field_key(&mut lp.filter_input, key),
+                    PaneKind::LocalFiles(ref mut lp) => apply_text_field_key(&mut lp.filter_input, key, &yank),
                     _ => TextFieldKeyOutcome::Unhandled,
                 };
                 match outcome {
@@ -264,8 +266,9 @@ impl App {
                     }
                     return;
                 }
+                let yank = self.yank_buffer.clone();
                 let outcome = match self.pane_mut(side) {
-                    PaneKind::RemoteFiles(ref mut rp) => apply_text_field_key(&mut rp.find_input, key),
+                    PaneKind::RemoteFiles(ref mut rp) => apply_text_field_key(&mut rp.find_input, key, &yank),
                     _ => TextFieldKeyOutcome::Unhandled,
                 };
                 match outcome {
@@ -282,7 +285,8 @@ impl App {
                     self.spawn_hub_search();
                     return;
                 }
-                match apply_text_field_key(&mut self.hub_search, key) {
+                let yank = self.yank_buffer.clone();
+                match apply_text_field_key(&mut self.hub_search, key, &yank) {
                     TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                         self.notify_copied_text(&t);
                     }
@@ -427,12 +431,15 @@ impl App {
             }
             (_, KeyCode::PageUp) => self.activity_scroll = self.activity_scroll.saturating_sub(6),
             (_, KeyCode::PageDown) => self.activity_scroll = self.activity_scroll.saturating_add(6),
-            _ => match apply_text_field_key(&mut self.prompt, key) {
-                TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
-                    self.notify_copied_text(&t);
+            _ => {
+                let yank = self.yank_buffer.clone();
+                match apply_text_field_key(&mut self.prompt, key, &yank) {
+                    TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
+                        self.notify_copied_text(&t);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
         }
     }
 
@@ -631,7 +638,7 @@ impl App {
                         .unwrap_or_else(|| lp.dir.to_string_lossy().to_string()),
                     _ => ".".into(),
                 };
-                copy_clipboard(&p);
+                self.set_clipboard_text(&p);
                 self.notify(format!("Copied {}", p), false);
             }
             KeyCode::Char('r') if !is_repeat => {
@@ -858,7 +865,7 @@ impl App {
                         .unwrap_or_else(|| rp.dir.clone()),
                     _ => "/kaggle/working".into(),
                 };
-                copy_clipboard(&p);
+                self.set_clipboard_text(&p);
                 self.notify(format!("Copied {}", p), false);
             }
             KeyCode::Char('d') | KeyCode::Delete if !is_repeat => self.trigger_delete_selected(),
@@ -874,6 +881,20 @@ impl App {
         }
         let is_repeat = key.kind == KeyEventKind::Repeat;
         if key.code == KeyCode::Esc {
+            let dirty_guard = match self.modal {
+                Some(Modal::FileEditor(ref mut m)) if m.dirty && !m.confirm_discard => {
+                    m.confirm_discard = true;
+                    true
+                }
+                _ => false,
+            };
+            if dirty_guard {
+                self.notify(
+                    "Unsaved changes! Press Esc again to discard, or Ctrl+S to save.",
+                    true,
+                );
+                return;
+            }
             self.modal = None;
             self.editor_mouse_selecting = false;
             return;
@@ -1063,7 +1084,8 @@ impl App {
                                     _ => None,
                                 };
                                 if let Some(tf) = tf {
-                                    match apply_text_field_key(tf, key) {
+                                    let yank = self.yank_buffer.clone();
+                                    match apply_text_field_key(tf, key, &yank) {
                                         TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                             self.notify_copied_text(&t);
                                         }
@@ -1096,7 +1118,8 @@ impl App {
                             1 => &mut m.gpu_ids,
                             _ => &mut m.name,
                         };
-                        match apply_text_field_key(tf, key) {
+                        let yank = self.yank_buffer.clone();
+                        match apply_text_field_key(tf, key, &yank) {
                             TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                 self.notify_copied_text(&t);
                             }
@@ -1116,7 +1139,8 @@ impl App {
                     }
                     _ if m.field_idx == 1 || m.field_idx == 2 => {
                         let tf = if m.field_idx == 1 { &mut m.local_path } else { &mut m.remote_path };
-                        match apply_text_field_key(tf, key) {
+                        let yank = self.yank_buffer.clone();
+                        match apply_text_field_key(tf, key, &yank) {
                             TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                 self.notify_copied_text(&t);
                             }
@@ -1133,7 +1157,16 @@ impl App {
                 match key.code {
                     KeyCode::Char('s' | 'S') if ctrl => {
                         if m.readonly {
-                            self.notify("Read-only file", true);
+                            let reason = if m.readonly_reason.is_empty() {
+                                "Read-only file".to_string()
+                            } else {
+                                m.readonly_reason.clone()
+                            };
+                            self.notify(reason, true);
+                            self.modal = Some(Modal::FileEditor(m));
+                            return;
+                        }
+                        if m.saving {
                             self.modal = Some(Modal::FileEditor(m));
                             return;
                         }
@@ -1146,23 +1179,44 @@ impl App {
                             }
                             match std::fs::write(&target, content.as_bytes()) {
                                 Ok(_) => {
+                                    m.dirty = false;
+                                    m.confirm_discard = false;
+                                    m.is_new = false;
                                     self.reload_all_local_panes();
                                     self.notify(format!("Saved local {}", p), false);
-                                    return;
                                 }
                                 Err(e) => self.notify(format!("Save failed: {}", e), true),
                             }
                             self.modal = Some(Modal::FileEditor(m));
                             return;
                         }
-                        let Some(sess) = self.active_session() else { return; };
+                        let Some(sess) = self.active_session() else {
+                            self.notify("No active worker session — your edits are still open.", true);
+                            self.modal = Some(Modal::FileEditor(m));
+                            return;
+                        };
+                        m.saving = true;
+                        m.confirm_discard = false;
+                        self.modal = Some(Modal::FileEditor(m));
                         let tid = self.begin_task(format!("Save {}", p));
                         let http = self.http.clone();
                         let tx = self.tx.clone();
                         tokio::spawn(async move {
-                            match http.fs_write_text(&sess, &p, &content).await {
-                                Ok(_) => { let _ = tx.send(AppMsg::FsOpDone { msg: format!("Saved {}", p), refresh: true }); }
-                                Err(e) => { let _ = tx.send(AppMsg::Toast { text: format!("Save failed: {}", e), is_err: true }); }
+                            match http.fs_write_text(&sess, &p, &content, true).await {
+                                Ok(_) => {
+                                    let _ = tx.send(AppMsg::FsSaveDone {
+                                        path: p,
+                                        ok: true,
+                                        err: String::new(),
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppMsg::FsSaveDone {
+                                        path: p,
+                                        ok: false,
+                                        err: e.to_string(),
+                                    });
+                                }
                             }
                             let _ = tx.send(AppMsg::TaskFinished(tid));
                         });
@@ -1176,13 +1230,14 @@ impl App {
                             self.notify_copied_text(&sel);
                         } else {
                             let full = m.lines.join("\n");
-                            copy_clipboard(&full);
+                            self.set_clipboard_text(&full);
                             self.notify(format!("Copied full file ({} chars)", full.chars().count()), false);
                         }
                     }
                     KeyCode::Char('x' | 'X') if ctrl => {
                         if m.focus_path {
-                            match apply_text_field_key(&mut m.path, key) {
+                            let yank = self.yank_buffer.clone();
+                            match apply_text_field_key(&mut m.path, key, &yank) {
                                 TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                     self.notify_copied_text(&t);
                                 }
@@ -1192,6 +1247,8 @@ impl App {
                             if let Some(sel) = m.selected_text() {
                                 self.notify_copied_text(&sel);
                                 m.delete_selection();
+                                m.dirty = true;
+                                m.confirm_discard = false;
                             }
                         }
                     }
@@ -1207,6 +1264,7 @@ impl App {
                     }
                     KeyCode::Char('p' | 'P') if ctrl && !m.is_local => {
                         self.spawn_sync(false, "./kaggle_downloads".into(), m.path.value.clone());
+                        self.modal = Some(Modal::FileEditor(m));
                         return;
                     }
                     KeyCode::Char('d' | 'D') if ctrl && m.is_new => {
@@ -1223,7 +1281,10 @@ impl App {
                             self.modal = Some(Modal::FileEditor(m));
                             return;
                         }
-                        let Some(sess) = self.active_session() else { return; };
+                        let Some(sess) = self.active_session() else {
+                            self.modal = Some(Modal::FileEditor(m));
+                            return;
+                        };
                         let http = self.http.clone();
                         let tx = self.tx.clone();
                         tokio::spawn(async move {
@@ -1236,7 +1297,7 @@ impl App {
                     }
                     KeyCode::Char('v' | 'V') if ctrl => {
                         if !m.readonly {
-                            if let Some(clip) = paste_clipboard() {
+                            if let Some(clip) = self.get_clipboard_text() {
                                 if m.focus_path {
                                     let clean: String = clip.replace("\r\n", "\n").lines().collect::<Vec<_>>().join(" ");
                                     m.path.insert_str(&clean);
@@ -1246,16 +1307,27 @@ impl App {
                                         if idx > 0 { editor_newline(&mut m); }
                                         editor_insert_str(&mut m, chunk);
                                     }
+                                    m.dirty = true;
+                                    m.confirm_discard = false;
                                 }
                             }
                         }
                     }
-                    KeyCode::Tab if m.is_new => m.focus_path = !m.focus_path,
+                    KeyCode::BackTab if m.is_new => m.focus_path = !m.focus_path,
+                    KeyCode::Tab if m.focus_path => {
+                        m.focus_path = false;
+                    }
+                    KeyCode::Tab if !m.readonly => {
+                        editor_insert_str(&mut m, "    ");
+                        m.dirty = true;
+                        m.confirm_discard = false;
+                    }
                     _ if m.focus_path => {
                         if key.code == KeyCode::Enter || (key.code == KeyCode::Down && !shift) {
                             m.focus_path = false;
                         } else {
-                            match apply_text_field_key(&mut m.path, key) {
+                            let yank = self.yank_buffer.clone();
+                            match apply_text_field_key(&mut m.path, key, &yank) {
                                 TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                     self.notify_copied_text(&t);
                                 }
@@ -1379,12 +1451,26 @@ impl App {
                             _ => {}
                         }
                     }
-                    KeyCode::Enter if !m.readonly => editor_newline(&mut m),
-                    KeyCode::Backspace if !m.readonly => editor_backspace(&mut m),
-                    KeyCode::Delete if !m.readonly => editor_delete(&mut m),
+                    KeyCode::Enter if !m.readonly => {
+                        editor_newline(&mut m);
+                        m.dirty = true;
+                        m.confirm_discard = false;
+                    }
+                    KeyCode::Backspace if !m.readonly => {
+                        editor_backspace(&mut m);
+                        m.dirty = true;
+                        m.confirm_discard = false;
+                    }
+                    KeyCode::Delete if !m.readonly => {
+                        editor_delete(&mut m);
+                        m.dirty = true;
+                        m.confirm_discard = false;
+                    }
                     KeyCode::Char(c) if !m.readonly && !ctrl => {
                         let mut s = [0u8; 4];
                         editor_insert_str(&mut m, c.encode_utf8(&mut s));
+                        m.dirty = true;
+                        m.confirm_discard = false;
                     }
                     _ => {}
                 }
@@ -1471,12 +1557,15 @@ impl App {
                         });
                         return;
                     }
-                    _ => match apply_text_field_key(&mut m.dst_path, key) {
-                        TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
-                            self.notify_copied_text(&t);
+                    _ => {
+                        let yank = self.yank_buffer.clone();
+                        match apply_text_field_key(&mut m.dst_path, key, &yank) {
+                            TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
+                                self.notify_copied_text(&t);
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                 }
                 self.modal = Some(Modal::PathAction(m));
             }
@@ -1563,7 +1652,8 @@ impl App {
                             _ => None,
                         };
                         if let Some(tf) = tf {
-                            match apply_text_field_key(tf, key) {
+                            let yank = self.yank_buffer.clone();
+                            match apply_text_field_key(tf, key, &yank) {
                                 TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                     self.notify_copied_text(&t);
                                 }
@@ -1628,7 +1718,8 @@ impl App {
                     }
                     _ => {
                         let tf = if m.field_idx == 0 { &mut m.competition } else { &mut m.message };
-                        match apply_text_field_key(tf, key) {
+                        let yank = self.yank_buffer.clone();
+                        match apply_text_field_key(tf, key, &yank) {
                             TextFieldKeyOutcome::Copied(t) | TextFieldKeyOutcome::Cut(t) => {
                                 self.notify_copied_text(&t);
                             }
@@ -1652,17 +1743,141 @@ impl App {
                             return;
                         }
                     }
-                    _ => match apply_text_field_key(&mut m.query, key) {
-                        TextFieldKeyOutcome::Changed => m.selected = 0,
-                        TextFieldKeyOutcome::Cut(t) => {
-                            m.selected = 0;
-                            self.notify_copied_text(&t);
+                    _ => {
+                        let yank = self.yank_buffer.clone();
+                        match apply_text_field_key(&mut m.query, key, &yank) {
+                            TextFieldKeyOutcome::Changed => m.selected = 0,
+                            TextFieldKeyOutcome::Cut(t) => {
+                                m.selected = 0;
+                                self.notify_copied_text(&t);
+                            }
+                            TextFieldKeyOutcome::Copied(t) => self.notify_copied_text(&t),
+                            _ => {}
                         }
-                        TextFieldKeyOutcome::Copied(t) => self.notify_copied_text(&t),
-                        _ => {}
-                    },
+                    }
                 }
                 self.modal = Some(Modal::CommandPalette(m));
+            }
+        }
+    }
+
+    pub fn handle_paste(&mut self, raw: String) {
+        let sanitized: String = raw
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|&c| c == '\n' || c == '\t' || (!c.is_control()))
+            .collect();
+        if sanitized.is_empty() {
+            return;
+        }
+        let one_line: String = sanitized
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if let Some(ref mut modal) = self.modal {
+            match modal {
+                Modal::FileEditor(ref mut m) => {
+                    if m.readonly {
+                        return;
+                    }
+                    if m.focus_path {
+                        m.path.insert_str(&one_line);
+                    } else {
+                        m.delete_selection();
+                        for (idx, chunk) in sanitized.split('\n').enumerate() {
+                            if idx > 0 {
+                                editor_newline(m);
+                            }
+                            let expanded = chunk.replace('\t', "    ");
+                            editor_insert_str(m, &expanded);
+                        }
+                        m.dirty = true;
+                        m.confirm_discard = false;
+                    }
+                }
+                Modal::Workers(ref mut m) if m.tab == 1 => {
+                    let tf = match m.field_idx {
+                        1 => Some(&mut m.profile_name),
+                        3 => Some(&mut m.slots),
+                        4 => Some(&mut m.datasets),
+                        5 => Some(&mut m.models),
+                        6 => Some(&mut m.competition),
+                        7 => Some(&mut m.idle_min),
+                        _ => None,
+                    };
+                    if let Some(tf) = tf {
+                        tf.insert_str(&one_line);
+                    }
+                }
+                Modal::SpawnJob(ref mut m) => {
+                    let tf = match m.field_idx {
+                        0 => &mut m.command,
+                        1 => &mut m.gpu_ids,
+                        _ => &mut m.name,
+                    };
+                    tf.insert_str(&one_line);
+                }
+                Modal::Sync(ref mut m) if m.field_idx == 1 || m.field_idx == 2 => {
+                    let tf = if m.field_idx == 1 {
+                        &mut m.local_path
+                    } else {
+                        &mut m.remote_path
+                    };
+                    tf.insert_str(&one_line);
+                }
+                Modal::PathAction(ref mut m) => m.dst_path.insert_str(&one_line),
+                Modal::PublishDataset(ref mut m) => {
+                    let tf = match m.field_idx {
+                        0 => Some(&mut m.source_dir),
+                        1 => Some(&mut m.slug),
+                        2 => Some(&mut m.title),
+                        3 => Some(&mut m.notes),
+                        _ => None,
+                    };
+                    if let Some(tf) = tf {
+                        tf.insert_str(&one_line);
+                    }
+                }
+                Modal::SubmitCompetition(ref mut m) => {
+                    let tf = if m.field_idx == 0 {
+                        &mut m.competition
+                    } else {
+                        &mut m.message
+                    };
+                    tf.insert_str(&one_line);
+                }
+                Modal::CommandPalette(ref mut m) => {
+                    m.query.insert_str(&one_line);
+                    m.selected = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match self.input_focus {
+            InputFocus::ShellPrompt => self.prompt.insert_str(&one_line),
+            InputFocus::LogFilter => self.log_filter.insert_str(&one_line),
+            InputFocus::LocalFilter(side) => {
+                if let PaneKind::LocalFiles(ref mut lp) = self.pane_mut(side) {
+                    lp.filter_input.insert_str(&one_line);
+                    lp.reload();
+                }
+            }
+            InputFocus::RemoteFind(side) => {
+                if let PaneKind::RemoteFiles(ref mut rp) = self.pane_mut(side) {
+                    rp.find_input.insert_str(&one_line);
+                }
+            }
+            InputFocus::HubSearch => self.hub_search.insert_str(&one_line),
+            InputFocus::None => {
+                if matches!(self.active_pane(), PaneKind::Shell) {
+                    self.input_focus = InputFocus::ShellPrompt;
+                    self.prompt.insert_str(&one_line);
+                }
             }
         }
     }

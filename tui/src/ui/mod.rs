@@ -337,15 +337,32 @@ fn render_slim_telemetry(f: &mut Frame, app: &App, area: Rect) {
     let st = &app.worker_status;
     let compute = if st.gpus.is_empty() {
         format!("CPU {:.1}%", st.cpu_pct)
+    } else if st.gpus.len() <= 2 {
+        st.gpus
+            .iter()
+            .map(|g| {
+                format!(
+                    "GPU{} {:.0}% {:.1}/{:.0}G {:.0}°C",
+                    g.index,
+                    g.util_pct,
+                    g.vram_used_mb / 1024.0,
+                    g.vram_total_mb / 1024.0,
+                    g.temp_c
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     } else {
-        let g = &st.gpus[0];
-        format!(
-            "{}x GPU0 {:.0}% ({:.1}/{:.1}G)",
-            st.gpus.len(),
-            g.util_pct,
-            g.vram_used_mb / 1024.0,
-            g.vram_total_mb / 1024.0
-        )
+        let total_used: f64 = st.gpus.iter().map(|g| g.vram_used_mb).sum::<f64>() / 1024.0;
+        let total_cap: f64 = st.gpus.iter().map(|g| g.vram_total_mb).sum::<f64>() / 1024.0;
+        let max_t: f64 = st.gpus.iter().map(|g| g.temp_c).fold(0.0, f64::max);
+        let utils: String = st
+            .gpus
+            .iter()
+            .map(|g| format!("G{}:{:.0}%", g.index, g.util_pct))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} ({:.1}/{:.0}G · {:.0}°C)", utils, total_used, total_cap, max_t)
     };
     let drain_s = st.remaining_before_drain_sec.max(0.0) as u64;
     let run_jobs = app.jobs.iter().filter(|j| j.status == "running").count();
@@ -1014,6 +1031,7 @@ mod tests {
             events: vec![],
             log_chunk: None,
             pty_live: None,
+            pty_sessions_live: std::collections::BTreeMap::new(),
         };
         app.handle_msg(AppMsg::MonitorOk { slot: "1".into(), rtt_ms: 88.0, payload: monitor_payload });
         app.selected_job_id = "job_lora_01".into();
@@ -1151,6 +1169,7 @@ mod tests {
             scroll_row: 0,
             readonly: false,
             focus_path: false,
+            ..Default::default()
         }));
         terminal
             .draw(|f| {

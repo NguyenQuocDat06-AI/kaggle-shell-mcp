@@ -64,7 +64,7 @@ pip install kaggle-shell-mcp
 Điền `KAGGLE_USERNAME` và `KAGGLE_KEY` vào `.env` hoặc dùng sẵn `~/.kaggle/kaggle.json`, sau đó chạy:
 
 ```powershell
-# Mở màn hình TUI Rust 60-FPS (lần đầu sẽ tự tải binary kgsh-tui dựng sẵn từ GitHub Release + kiểm tra SHA-256)
+# Mở màn hình TUI Rust 60-FPS (lần đầu tự tải binary kgsh-tui dựng sẵn cho Windows, Linux x86_64/aarch64, macOS + kiểm tra SHA-256 Fail-Closed)
 kgsh ui
 
 # Hoặc thao tác trực tiếp bằng CLI:
@@ -72,6 +72,11 @@ kgsh quota
 kgsh up -s 1
 kgsh shell -s 1
 ```
+
+### Điểm mới nổi bật trong bản `v1.0.1`
+- **Hỗ trợ trọn vẹn Linux ARM64 (`aarch64` static `musl`) & Copy qua SSH (`OSC 52`)**: `kgsh ui` chạy mượt trên các máy chủ Ubuntu ARM64/x86_64 không có X11; `Ctrl+C`/`Ctrl+X`/`Ctrl+V` giữ nguyên văn bản qua `yank_buffer` nội bộ đồng thời đẩy clipboard về máy trạm qua chuỗi `OSC 52`.
+- **Bảo vệ dữ liệu & chống rò rỉ 30h Quota GPU**: Tự động thu gom `submission.csv` và `checkpoints/` từ `/tmp` về `/kaggle/working` khi kết thúc Offline Batch; khóa `Read-Only` khi file từ xa lớn hơn `256 KB` bị cắt cụt; cảnh báo khi bấm `Esc` chưa lưu; và cơ chế tắt máy 3 tầng (`kgsh down [-f]`) không bao giờ xóa mù `sessions.json` khi GPU vẫn đang chạy.
+- **Lọc tệp nhạy cảm tự động**: Chặn mặc định `.env`, `.env.*` (giữ `.env.example`), `kaggle.json`, khóa SSH/TLS và thư mục `kaggle_pull` khi đồng bộ lên Kaggle.
 
 ### 3. Build từ mã nguồn GitHub (Dành cho developer)
 

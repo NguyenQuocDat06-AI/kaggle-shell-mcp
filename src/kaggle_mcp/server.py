@@ -8,7 +8,6 @@ import logging
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any
 
 try:
@@ -16,8 +15,8 @@ try:
 except ImportError:
     from mcp.server.fastmcp import FastMCP as _MCPServerClass  # type: ignore[no-redef]
 
-from . import __version__
-from .activity import mcp_call_span, record_local_activity
+from . import __version__, config
+from .activity import mcp_call_span
 from .batch import build_wheelhouse, read_batch_logs_windowed, submit_offline_batch
 from .client import WorkerClient
 from .config import (
@@ -33,7 +32,7 @@ from .launcher import (
     get_kaggle_api,
     get_kernel_status,
     launch_workers_multi,
-    pull_kernel_outputs,
+    shutdown_slot,
 )
 from .quota import fetch_quota_summary
 
@@ -174,39 +173,12 @@ def kaggle_status(slot: str = "all") -> str:
         )
 
 
-def _shutdown_one_slot(
-    settings: Any,
-    s: str,
-    pull_outputs: bool,
-    local_output_dir: str,
-    caller: str = "mcp",
-) -> dict[str, Any]:
-    out: dict[str, Any] = {"slot": s, "shutdown_sent": False}
-    sess = load_active_session(s)
-    kref = sess.kernel_ref if (sess and sess.kernel_ref) else ""
-
-    if not sess or sess.mode == "live":
-        try:
-            client = WorkerClient(settings, slot=s, caller=caller)
-            out["worker_response"] = client.shutdown()
-            out["shutdown_sent"] = True
-        except Exception as exc:
-            out["shutdown_note"] = str(exc)
-
-    clear_active_session(s)
-    record_local_activity(s, caller, "shutdown", f"Shut down slot '{s}'")
-
-    if pull_outputs:
-        dest = Path(local_output_dir) / f"slot_{s}" if local_output_dir else Path(f"./kaggle_outputs/slot_{s}")
-        out["pulled_files"] = pull_kernel_outputs(settings, dest, slot=s, kernel_ref=kref)
-    return out
-
-
 @mcp.tool()
 def kaggle_down(
     slot: str = "1",
     pull_outputs: bool = False,
     local_output_dir: str = "./kaggle_outputs",
+    force: bool = False,
 ) -> str:
     """Gracefully stop a remote Kaggle worker (`exit 0`) to save GPU quota; pass `slot='all'` to stop all slots."""
     with mcp_call_span("kaggle_down", slot=slot, summary=f"slot={slot} pull={pull_outputs}"):
@@ -217,14 +189,31 @@ def kaggle_down(
             slots = sorted(load_all_sessions().keys()) or ["1"]
             with ThreadPoolExecutor(max_workers=min(4, len(slots))) as pool:
                 results = list(
-                    pool.map(lambda s: _shutdown_one_slot(settings, s, pull_outputs, local_output_dir), slots)
+                    pool.map(
+                        lambda s: shutdown_slot(
+                            settings,
+                            s,
+                            pull_outputs=pull_outputs,
+                            local_output_dir=local_output_dir,
+                            single_slot_dest=False,
+                            force=force,
+                            caller="mcp",
+                        ),
+                        slots,
+                    )
                 )
             return _fmt({"stopped_slots": results})
 
         s = normalize_slot(raw)
-        out = _shutdown_one_slot(settings, s, pull_outputs=False, local_output_dir=local_output_dir)
-        if pull_outputs:
-            out["pulled_files"] = pull_kernel_outputs(settings, Path(local_output_dir), slot=s)
+        out = shutdown_slot(
+            settings,
+            s,
+            pull_outputs=pull_outputs,
+            local_output_dir=local_output_dir,
+            single_slot_dest=True,
+            force=force,
+            caller="mcp",
+        )
         return _fmt(out)
 
 
@@ -439,6 +428,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     p_down.add_argument("-s", "--slot", default="1", help="Slot ID ('1', '2', or 'all')")
     p_down.add_argument("--pull", action="store_true", help="Download committed /kaggle/working outputs")
     p_down.add_argument("--out", default="./kaggle_outputs", help="Local output folder when --pull is set")
+    p_down.add_argument("-f", "--force", action="store_true", help="Hard-cancel stuck/queued ephemeral kernel")
 
     p_exec = sub.add_parser("exec", help="Execute command in persistent remote PTY")
     p_exec.add_argument("command", help="Bash command string")
@@ -520,7 +510,15 @@ def _run_cli(argv: list[str]) -> None:
             print(str(exc), file=sys.stderr)
             sys.exit(1)
         rc = subprocess.run(
-            [str(exe_path), "--slot", normalize_slot(args.slot), "--python", sys.executable],
+            [
+                str(exe_path),
+                "--slot",
+                normalize_slot(args.slot),
+                "--state-dir",
+                str(config.STATE_DIR),
+                "--python",
+                sys.executable,
+            ],
             check=False,
         ).returncode
         sys.exit(rc)
@@ -561,7 +559,7 @@ def _run_cli(argv: list[str]) -> None:
     elif args.cmd == "status":
         print(kaggle_status(slot=args.slot))
     elif args.cmd == "down":
-        print(kaggle_down(slot=args.slot, pull_outputs=args.pull, local_output_dir=args.out))
+        print(kaggle_down(slot=args.slot, pull_outputs=args.pull, local_output_dir=args.out, force=args.force))
     elif args.cmd == "exec":
         res = WorkerClient(load_settings(), slot=args.slot, caller="cli").term_exec(
             command=args.command,

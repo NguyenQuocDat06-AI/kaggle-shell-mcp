@@ -45,12 +45,13 @@ Inspect weekly GPU (30h) & TPU (20h) quota, switch or stop parallel slots (`slot
 
 ## Why `kaggle-shell-mcp`?
 
-- **Zero-Black-Box MCP + 60-FPS Rust TUI (`kgsh ui`)**: Watch every command your AI Agent sends in real time, interrupt hung loops (`Ctrl+C`), browse/edit/preview remote files, inspect `.parquet`/`.csv`/`.safetensors`/`.pt`/`.zip` files, and kill leaked CUDA PIDs directly.
-- **Zero-Setup Prebuilt Binary Auto-Download**: Running `kgsh ui` after `pip install kaggle-shell-mcp` automatically downloads the matching prebuilt `kgsh-tui` binary for **Windows, Linux, or macOS** from GitHub Releases (with `SHA256SUMS.txt` verification) into `~/.kaggle_mcp/bin/` — **no Rust toolchain required**.
-- **One-Line Credentials**: Works out of the box with `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` token, legacy key, or `~/.kaggle/kaggle.json`). No `ngrok` account or manual browser clicks required.
-- **Dual Concurrent GPU VMs (`4 × Tesla T4 = 60 GB VRAM`)**: Run up to **2 parallel live Kaggle GPU VMs** (`slot="1,2"`) and pin individual background jobs (`gpu_ids="0"` / `"1"`) to execute **4 isolated GPU experiments simultaneously**.
+- **Zero-Black-Box MCP + 60-FPS Rust TUI (`kgsh ui`)**: Watch every command your AI Agent sends in real time, interrupt hung loops (`Ctrl+C`) on an isolated TUI shell without killing Agent sessions, browse/edit/preview remote files safely (`256 KB` cap with automatic Read-Only lock on truncated/binary files & unsaved-edit guard), inspect `.parquet`/`.csv`/`.safetensors`/`.pt`/`.zip` files, and monitor **Multi-GPU VRAM & `°C` telemetry** (`GPU0`, `GPU1`, ...).
+- **Zero-Setup Prebuilt Binary Auto-Download (`x86_64` & `ARM64`)**: Running `kgsh ui` after `pip install kaggle-shell-mcp` automatically downloads the matching prebuilt `kgsh-tui` binary for **Windows (`x86_64`), Linux (`x86_64` & `aarch64` static `musl`), or macOS (`arm64` & `x86_64`)** from GitHub Releases with **Fail-Closed `SHA256SUMS.txt` verification** into `~/.kaggle_mcp/bin/` — **no Rust toolchain required**.
+- **SSH-Ready Clipboard (`OSC 52` + Internal Yank Buffer)**: `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, mouse drag, and Bracketed Paste work seamlessly even over headless SSH servers without X11/Wayland.
+- **One-Line Credentials & Secret-Safe Sync**: Works out of the box with `KAGGLE_USERNAME` and `KAGGLE_KEY` (`KGAT_...` token, legacy key, or `~/.kaggle/kaggle.json`, requiring `kaggle>=2.2.0`). `fs_sync` and TUI Push automatically exclude `.env*` (keeping `.env.example`), `kaggle.json`, SSH/TLS keys, and local pull directories.
+- **Dual Concurrent GPU VMs (`4 × Tesla T4 = 60 GB VRAM`) & Verified Shutdown**: Run up to **2 parallel live Kaggle GPU VMs** (`slot="1,2"`), pin individual background jobs (`gpu_ids="0"` / `"1"`), and stop slots via 3-tier verified shutdown (`kgsh down [-f]`) that never wipes `sessions.json` while a GPU VM is still running.
 - **Full Hardware & Kaggle Hub Support**: Target `NvidiaTeslaT4` (`2×15 GB`), `NvidiaL4`, `NvidiaL4x4` (`96 GB`), `NvidiaRtxPro6000` (`96 GB`), `NvidiaH100`, `TpuV5E8` / `TpuV6E8`, or `cpu`, with native `competition_sources` and Kaggle Hub `model_sources` mounts.
-- **Offline Competition Mode + Host SSE Live Logs**: When `L4x4` / `RTX Pro 6000` enforces `enable_internet=False`, `kaggle_wheelhouse` + `kaggle_batch_run` bundle Linux wheels & local code and stream live stdout via Kaggle's Host SSE endpoint (`kaggle_batch_logs`).
+- **Offline Competition Mode + Auto-Harvest + Host SSE Live Logs**: When `L4x4` / `RTX Pro 6000` enforces `enable_internet=False`, `kaggle_wheelhouse` + `kaggle_batch_run` use isolated per-run slugs (`kgsh-batch-<slot>-<run>`), automatically harvest relative outputs (`submission.csv`, `checkpoints/`) from `/tmp` into `/kaggle/working` on exit, and stream live stdout via Kaggle's Host SSE endpoint (`kaggle_batch_logs`).
 - **11h40m (`8h40m` TPU) Safe-Drain Watchdog**: Sends `SIGTERM` at `11h35m` (`8h35m` on TPU) to flush checkpoints and exits cleanly (`exit 0`) at `11h40m` so `/kaggle/working` (19.5 GB) snapshots persist.
 
 ---
@@ -125,15 +126,15 @@ cargo build --release --manifest-path tui/Cargo.toml
 | `kaggle_quota` | Check remaining weekly Kaggle GPU (30h) & TPU (20h) quota hours and reset timestamp |
 | `kaggle_up` | Boot 1 or 2 parallel headless workers (`slot="1"`, `"2"`, or `"1,2"`, `accelerator`, `competition`, `mount_datasets`, `mount_models`, opt-in `idle_timeout_min`) |
 | `kaggle_status` | Inspect live GPU/VRAM telemetry, RAM, disk, and kernel states across `slot="all"` or a specific slot (auto-cleans stale sessions) |
-| `kaggle_down` | Gracefully stop `slot="1"`, `"2"`, or `"all"` (`exit 0`) to save GPU quota; optionally pull `/kaggle/working` |
+| `kaggle_down` | Verified 3-tier shutdown for `slot="1"`, `"2"`, or `"all"` (waits for `COMPLETE` before pulling outputs; `force=True` cancels unreachable/queued ephemeral runners) |
 | `term_exec` | Run bash commands in a persistent stateful PTY on `slot` (`cwd`, exports, and virtualenvs persist across calls) |
 | `job_spawn` | Launch detached background jobs on `slot` with optional `gpu_ids` (`CUDA_VISIBLE_DEVICES="0"` or `"1"`) |
 | `job_list` | List active and finished background jobs on `slot` with PID, GPU assignment, runtime, and log size |
 | `job_logs` | Read tail lines of a background job log on `slot` (with regex `grep` and automatic `tqdm` `\r` cleanup) |
 | `job_kill` | Send `SIGTERM` or `SIGKILL` to a background job's process group on `slot` and release VRAM |
-| `fs_sync` | `push` local folders (auto-skipping `.git`, `.venv`, `__pycache__`) or `pull` remote checkpoints/logs on `slot` |
+| `fs_sync` | `push` local folders (auto-blocking `.env*`, `kaggle.json`, private keys & caches) or `pull` remote checkpoints/logs on `slot` |
 | `kaggle_wheelhouse` | Download Linux `manylinux_x86_64` binary `.whl` packages and publish a private Dataset for offline runs |
-| `kaggle_batch_run` | Submit an offline competition batch job (`NvidiaL4x4`, `NvidiaRtxPro6000`, `TpuV5E8`, `enable_internet=False`) with automatic code bundling |
+| `kaggle_batch_run` | Submit an isolated run-scoped offline competition batch job (`NvidiaL4x4`, `NvidiaRtxPro6000`, `TpuV5E8`, `enable_internet=False`) with automatic `/tmp -> /kaggle/working` artifact harvesting |
 | `kaggle_batch_logs` | Stream live or completed logs via Kaggle's Host SSE endpoint—even when container internet is disabled |
 
 ---

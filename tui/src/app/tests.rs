@@ -264,6 +264,7 @@ use tokio::sync::mpsc;
                     elapsed_sec: 3.5,
                     output: "step 1/100\nstep 2/100\nstep 3/100".into(),
                 }),
+                ..Default::default()
             },
         });
 
@@ -313,6 +314,7 @@ use tokio::sync::mpsc;
             scroll_row: 0,
             readonly: false,
             focus_path: false,
+            ..Default::default()
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
@@ -601,4 +603,180 @@ use tokio::sync::mpsc;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn test_v101_editor_truncation_readonly_dirty_guard_and_save_flow() {
+        let dir = std::env::temp_dir().join(format!("kgsh_ed_v101_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bridge = PythonBridge::discover(None);
+        let mut app = App::new(dir.clone(), "1".into(), bridge, tx);
+
+        // 1. Truncated remote file MUST open strictly READ-ONLY to prevent 64KB+ tail truncation!
+        app.handle_msg(AppMsg::FsReadDone {
+            path: "/kaggle/working/large_train.py".into(),
+            content: "import torch\n".into(),
+            truncated: true,
+            is_binary: false,
+            size_bytes: 500_000,
+        });
+        match &app.modal {
+            Some(Modal::FileEditor(m)) => {
+                assert!(m.readonly);
+                assert!(m.readonly_reason.contains("truncated"));
+            }
+            _ => panic!("expected FileEditor modal"),
+        }
+        // Typing in readonly editor must not mutate lines or set dirty
+        app.handle_key(ke(KeyCode::Char('Z'), KeyModifiers::NONE));
+        if let Some(Modal::FileEditor(ref m)) = app.modal {
+            assert_eq!(m.lines[0], "import torch");
+            assert!(!m.dirty);
+        }
+        // Esc closes clean readonly editor immediately
+        app.handle_key(ke(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+
+        // 2. Editable local file: dirty Esc requires confirmation; Ctrl+S keeps editor open until FsSaveDone!
+        let local_py = dir.join("model.py");
+        std::fs::write(&local_py, "x = 1\n").unwrap();
+        app.open_local_file_editor(local_py);
+        assert!(matches!(app.modal, Some(Modal::FileEditor(ref m)) if !m.readonly && !m.dirty));
+
+        app.handle_key(ke(KeyCode::Char('#'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::FileEditor(ref m)) if m.dirty && !m.confirm_discard));
+
+        // First Esc warns instead of discarding unsaved edits
+        app.handle_key(ke(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::FileEditor(ref m)) if m.confirm_discard));
+        // Second Esc confirms discard
+        app.handle_key(ke(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+
+        // Re-open remote non-truncated file, edit, then FsSaveDone(ok=true) closes modal cleanly
+        app.handle_msg(AppMsg::FsReadDone {
+            path: "/kaggle/working/small.py".into(),
+            content: "lr = 1e-4\n".into(),
+            truncated: false,
+            is_binary: false,
+            size_bytes: 10,
+        });
+        app.handle_key(ke(KeyCode::End, KeyModifiers::NONE));
+        app.handle_key(ke(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(ke(KeyCode::Tab, KeyModifiers::NONE));
+        if let Some(Modal::FileEditor(ref m)) = app.modal {
+            assert_eq!(m.lines[1], "    ");
+            assert!(m.dirty);
+        }
+        // Failed save keeps modal open with dirty=true!
+        app.handle_msg(AppMsg::FsSaveDone {
+            path: "/kaggle/working/small.py".into(),
+            ok: false,
+            err: "HTTP 524".into(),
+        });
+        assert!(matches!(app.modal, Some(Modal::FileEditor(ref m)) if m.dirty && !m.saving));
+        // Successful save clears dirty/saving while keeping editor open; single Esc then closes cleanly
+        app.handle_msg(AppMsg::FsSaveDone {
+            path: "/kaggle/working/small.py".into(),
+            ok: true,
+            err: String::new(),
+        });
+        assert!(matches!(app.modal, Some(Modal::FileEditor(ref m)) if !m.dirty && !m.saving));
+        app.handle_key(ke(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_v101_yank_buffer_osc52_and_bracketed_paste_sanitization() {
+        let dir = std::env::temp_dir().join(format!("kgsh_clip_v101_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bridge = PythonBridge::discover(None);
+        let mut app = App::new(dir.clone(), "1".into(), bridge, tx);
+
+        // OSC 52 sequence validation
+        assert_eq!(
+            build_osc52_sequence("hello"),
+            Some("\x1b]52;c;aGVsbG8=\x07".to_string())
+        );
+        assert_eq!(build_osc52_sequence(""), None);
+        assert_eq!(build_osc52_sequence(&"A".repeat(60_000)), None);
+
+        // Ctrl+X + Ctrl+V in ShellPrompt preserves cut text via internal yank_buffer on headless SSH!
+        app.input_focus = InputFocus::ShellPrompt;
+        app.prompt = TextField::new("torchrun train.py");
+        app.prompt.select_all();
+        app.handle_key(ke(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(app.prompt.value, "");
+        assert_eq!(app.yank_buffer, "torchrun train.py");
+
+        app.handle_key(ke(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(app.prompt.value, "torchrun train.py");
+
+        // Bracketed paste strips ESC / C0 terminal injection bytes
+        app.prompt = TextField::new("");
+        app.handle_paste("echo safe\x1b[2J\x07\r\necho line2".into());
+        assert!(!app.prompt.value.contains('\x1b'));
+        assert!(!app.prompt.value.contains('\x07'));
+        assert!(app.prompt.value.contains("echo safe"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_v101_poll_in_flight_and_tui_session_isolation() {
+        use crate::worker::PtyLive;
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!("kgsh_iso_v101_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bridge = PythonBridge::discover(None);
+        let mut app = App::new(dir.clone(), "1".into(), bridge, tx);
+
+        // Agent PTY running in `pty_sessions_live["default"]` must NOT hijack TUI's `running_exec`!
+        let mut live_map = BTreeMap::new();
+        live_map.insert(
+            "default".to_string(),
+            PtyLive {
+                running: true,
+                session: "default".into(),
+                command: "agent_secret_scan.py".into(),
+                elapsed_sec: 2.0,
+                output: "agent out".into(),
+            },
+        );
+        app.handle_msg(AppMsg::MonitorOk {
+            slot: "1".into(),
+            rtt_ms: 12.0,
+            payload: MonitorPayload {
+                pty_sessions_live: live_map,
+                ..Default::default()
+            },
+        });
+        assert!(app.running_exec.is_none());
+
+        // Batch poll respects `poll_backoff_until` before spawning Python subprocess
+        app.sessions.insert(
+            "batch-1".into(),
+            ActiveSession {
+                slot: "batch-1".into(),
+                mode: "batch".into(),
+                kernel_ref: "alice/kgsh-batch-1-abc123".into(),
+                ..Default::default()
+            },
+        );
+        app.current_slot = "batch-1".into();
+        app.poll_backoff_until = Some(Instant::now() + Duration::from_secs(30));
+        app.poll_tick();
+        assert!(app.poll_in_flight.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 

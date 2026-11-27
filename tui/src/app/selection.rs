@@ -137,7 +137,7 @@ impl App {
         }
         let lines_cnt = txt.lines().count();
         let n = txt.chars().count();
-        copy_clipboard(txt);
+        self.set_clipboard_text(txt);
         let msg = if lines_cnt > 1 {
             format!("Copied {} chars ({} lines)", n, lines_cnt)
         } else {
@@ -388,7 +388,7 @@ impl App {
             return;
         };
         let n = txt.chars().count();
-        copy_clipboard(&txt);
+        self.set_clipboard_text(&txt);
         self.notify(format!("Copied {} chars", n), false);
     }
 
@@ -412,7 +412,7 @@ impl App {
             return;
         }
         let n = txt.chars().count();
-        copy_clipboard(&txt);
+        self.set_clipboard_text(&txt);
         self.notify(format!("Copied {} shell chars", n), false);
     }
 

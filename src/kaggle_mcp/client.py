@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import ssl
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,8 @@ def summarize_http_error(slot: str, status_code: int, raw_body: str) -> str:
 
     if status_code == 530 or "cloudflare tunnel error" in low:
         return f"Worker [slot={slot}] tunnel closed (HTTP {status_code} — VM stopped or tunnel offline)."
+    if status_code == 524:
+        return f"Worker [slot={slot}] HTTP 524: Cloudflare 100s origin timeout exceeded."
     if status_code in {502, 504} and is_html:
         return f"Worker [slot={slot}] tunnel unreachable (HTTP {status_code})."
     if is_html:
@@ -160,6 +163,17 @@ class WorkerClient:
                 return sess
         return None
 
+    _SAFE_READONLY_POSTS = {
+        "/monitor",
+        "/fs/list",
+        "/fs/read_text",
+        "/fs/du",
+        "/fs/inspect",
+        "/fs/find",
+        "/jobs/logs",
+        "/jobs/logs_chunk",
+    }
+
     def _request(
         self,
         method: str,
@@ -175,6 +189,8 @@ class WorkerClient:
             "Authorization": f"Bearer {sess.worker_token}",
             "X-Kgsh-Caller": self.caller,
         }
+        if method.upper() == "POST" and path not in self._SAFE_READONLY_POSTS:
+            headers["X-Idempotency-Key"] = uuid.uuid4().hex
         if extra_headers:
             headers.update(extra_headers)
 
@@ -184,6 +200,7 @@ class WorkerClient:
             write=min(60.0, float(timeout)),
             pool=5.0,
         )
+        can_retry_after_send = method.upper() == "GET" or path in self._SAFE_READONLY_POSTS
 
         for attempt in range(2):
             base = sess.base_url
@@ -198,7 +215,13 @@ class WorkerClient:
                     headers=headers,
                     timeout=req_timeout,
                 )
-                if resp.status_code in {502, 504, 530} and attempt == 0:
+                if resp.status_code in {502, 530} and attempt == 0:
+                    _evict_pooled_client(base)
+                    refreshed = self._refresh_endpoint(sess)
+                    if refreshed:
+                        sess = refreshed
+                        continue
+                if resp.status_code == 504 and attempt == 0 and can_retry_after_send:
                     _evict_pooled_client(base)
                     refreshed = self._refresh_endpoint(sess)
                     if refreshed:
@@ -207,9 +230,17 @@ class WorkerClient:
                 if resp.status_code >= 400:
                     raise RuntimeError(summarize_http_error(self.slot, resp.status_code, resp.text))
                 return resp
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
+            except (httpx.ConnectError, httpx.PoolTimeout) as exc:
                 _evict_pooled_client(base)
                 if attempt == 0:
+                    refreshed = self._refresh_endpoint(sess)
+                    if refreshed:
+                        sess = refreshed
+                        continue
+                raise RuntimeError(f"Lỗi kết nối tới Kaggle worker [slot={self.slot}] ({url}): {exc}") from exc
+            except (httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                _evict_pooled_client(base)
+                if attempt == 0 and can_retry_after_send:
                     refreshed = self._refresh_endpoint(sess)
                     if refreshed:
                         sess = refreshed
@@ -392,13 +423,23 @@ class WorkerClient:
             txt = res.get("output", "")
             return {"path": remote_path, "size_bytes": len(txt), "truncated": False, "content": txt}
 
-    def fs_write_text(self, remote_path: str, content: str) -> dict[str, Any]:
+    def fs_write_text(
+        self,
+        remote_path: str,
+        content: str,
+        *,
+        allow_overwrite_large: bool = False,
+    ) -> dict[str, Any]:
         """Create or overwrite a UTF-8 file on the remote worker (with 404 PTY fallback)."""
         try:
             return self._request(
                 "POST",
                 "/fs/write_text",
-                json_body={"path": remote_path, "content": content},
+                json_body={
+                    "path": remote_path,
+                    "content": content,
+                    "allow_overwrite_large": allow_overwrite_large,
+                },
                 timeout=30.0,
             ).json()
         except RuntimeError as exc:
@@ -410,7 +451,9 @@ class WorkerClient:
             py = (
                 "python3 -c \"import base64,pathlib; p=pathlib.Path("
                 + repr(remote_path)
-                + "); p.parent.mkdir(parents=True, exist_ok=True); "
+                + ").resolve(); "
+                + f"assert {self._is_writable_sandbox_expr('p')}, 'Refused unsafe path'; "
+                + "p.parent.mkdir(parents=True, exist_ok=True); "
                 + f"data=base64.b64decode({b64!r}); p.write_bytes(data); "
                 + "print(len(data))\""
             )
@@ -431,9 +474,14 @@ class WorkerClient:
         except RuntimeError as exc:
             if "HTTP 404" not in str(exc):
                 raise
-            import shlex as _shlex
-
-            res = self.term_exec(f"mkdir -p {_shlex.quote(remote_path)}", timeout_sec=15.0)
+            py = (
+                "python3 -c \"import pathlib; p=pathlib.Path("
+                + repr(remote_path)
+                + ").resolve(); "
+                + f"assert {self._is_writable_sandbox_expr('p')}, 'Refused unsafe path'; "
+                + "p.mkdir(parents=True, exist_ok=True)\""
+            )
+            res = self.term_exec(py, timeout_sec=15.0)
             if int(res.get("exit_code", 1)) != 0:
                 raise RuntimeError(f"Remote mkdir failed: {res.get('output', '')}") from None
             return {"ok": True, "path": remote_path}
@@ -465,7 +513,8 @@ class WorkerClient:
     @staticmethod
     def _is_writable_sandbox_expr(var_name: str) -> str:
         return (
-            f"(str({var_name}).startswith('/kaggle/working/') or str({var_name}).startswith('/tmp/'))"
+            f"((str({var_name}).startswith('/kaggle/working/') or str({var_name}).startswith('/tmp/')) "
+            f"and not str({var_name}).startswith('/tmp/kaggle_mcp_runtime'))"
         )
 
     def fs_rename(self, src_path: str, dst_path: str) -> dict[str, Any]:

@@ -2,6 +2,33 @@
 
 All notable changes to **`kaggle-shell-mcp`** (`kgsh`) will be documented in this file.
 
+## [1.0.1] - 2026-11-28
+
+### Added
+- **Prebuilt Linux ARM64 (`aarch64`) & Pure-Rust `rustls` TUI Builds (`release-tui.yml`, `tui/Cargo.toml`)**:
+  - Added static `aarch64-unknown-linux-musl` (`kgsh-tui-linux-aarch64.tar.gz`) alongside `linux-x86_64`, `windows-x86_64`, `macos-arm64`, and `macos-x86_64`, plus `KGSH_TUI_BIN` environment override.
+- **SSH-Ready Clipboard (`OSC 52` + Internal `yank_buffer` + Bracketed Paste) & Multi-GPU Telemetry (`tui/`)**:
+  - Preserves `Ctrl+X` / `Ctrl+C` / `Ctrl+V` 100% via an internal yank buffer on headless SSH servers without X11/Wayland while emitting Base64-whitelisted `OSC 52` sequences to the host terminal and sanitizing Bracketed Paste input.
+  - Upgraded the telemetry strip to display utilization, VRAM, and `°C` across all attached GPUs (`GPU0`, `GPU1`, ...) instead of only `gpus[0]`, and added viewport scrolling to `ActionMenu`, `CommandPalette`, and `Help` modals on compact `80×24` terminals.
+- **Offline Batch Auto-Harvest & Run-Scoped Batch Slugs (`batch.py`, `config.py`)**:
+  - `OFFLINE_RUNNER_TEMPLATE` snapshots `/tmp/kgsh_batch_work` before launch and automatically harvests newly created or modified artifacts (`submission.csv`, `checkpoints/`) into `/kaggle/working` (`os.sync()`) on exit.
+  - Batch runs now allocate isolated per-run slugs (`<user>/kgsh-batch-<slot>-<run6>`) so cancelling one batch run never deletes outputs from earlier runs.
+
+### Fixed
+- **Remote `FileEditor` Truncation & Unsaved-Edit Guards (`tui/`, `worker_template.py`)**:
+  - Raised editor read cap to `256 KB` (`512 KB` on worker), forced `Read-Only` mode when a file is truncated or binary (preventing silent `>64 KB` tail loss on `Ctrl+S`), kept the editor open until `FsSaveDone` succeeds, added an `Esc` confirmation prompt on dirty buffers, and guarded `/fs/write_text` with `HTTP 412` when overwriting large files without `allow_overwrite_large`.
+- **3-Tier Verified `kaggle_down`, Provisioning Token Persistence & Idempotent RPCs (`launcher.py`, `client.py`, `worker_template.py`)**:
+  - `shutdown_slot` waits up to 60s for `COMPLETE` before pulling kernel outputs, supports out-of-band `kernels_delete` cancellation for ephemeral/queued runners (`--force` / `force=True`), and refuses to wipe `sessions.json` (`status="unreachable"`) if a GPU VM is still running.
+  - `launch_worker` saves `ActiveSession(status="provisioning")` immediately after `kernels_push` and resumes waiting instead of pushing duplicate kernel versions after a timeout.
+  - Added `X-Idempotency-Key` + `IdempotencyRegistry` and disabled blind retries on timed-out mutating `POST` requests.
+- **TUI/Agent PTY Isolation, Poll Storm Fix, `STATE_DIR` Sync & Host SSE Stability (`worker_template.py`, `batch.py`, `tui/`)**:
+  - Scoped `PtyManager.interrupt` strictly to the target session (`"tui"` vs `"default"`), fixed `poll_in_flight` and `poll_backoff_until` ordering in batch mode, synchronized `--state-dir` / `KAGGLE_MCP_HOME` between Python and Rust, closed underlying SSE HTTP sockets cleanly, eliminated $O(N^2)$ SSE log duplication (`merge_sse_log_snapshot`), fixed `cloudflared` QUIC -> HTTP/2 fallback counting, and bumped minimum SDK dependency to `kaggle>=2.2.0`.
+
+### Security
+- **Default Credential Filtering, Child Env Scrubbing, Sandbox & Fail-Closed SHA-256 (`sync.py`, `tui_bin.py`, `worker.rs`, `config.py`, `worker_template.py`)**:
+  - Excluded `.env`, `.env.*` (keeping `.env.example`), `kaggle.json`, SSH/TLS private keys, `.netrc`, and `kaggle_pull/` directories from `fs_sync` and TUI Push by default.
+  - Scrubbed `KAGGLE_API_TOKEN`, `KAGGLE_KEY`, and `TS_AUTHKEY` from child PTY/job environments, enforced `0700`/`0600` permissions on `.kaggle_mcp` files on POSIX, blocked writes to `/tmp/kaggle_mcp_runtime`, hardened archive extractors against sibling-prefix/symlink escapes and `>2 GiB` Tar Bombs, and switched `tui_bin.py` to Fail-Closed `SHA256SUMS.txt` verification.
+
 ## [1.0.0] - 2026-11-27
 
 ### Added

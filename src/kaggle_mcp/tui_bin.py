@@ -56,8 +56,26 @@ def cached_binary_path(version: str = __version__, exe_name: str | None = None) 
     return config.STATE_DIR / "bin" / f"v{version}" / name
 
 
+def _fallback_hint() -> str:
+    if (config.PROJECT_ROOT / "tui" / "Cargo.toml").is_file():
+        return (
+            "You can build locally instead: cargo build --release --manifest-path tui/Cargo.toml "
+            "(or use `kgsh shell` for the pure-Python REPL)."
+        )
+    return (
+        "Set KGSH_TUI_BIN=/path/to/kgsh-tui if behind an enterprise firewall, "
+        "or use `kgsh shell` for the built-in interactive terminal."
+    )
+
+
 def find_existing_tui_binary(version: str = __version__) -> Path | None:
     """Locate an already-built/installed/cached `kgsh-tui` executable without hitting network."""
+    explicit = (os.environ.get("KGSH_TUI_BIN") or "").strip()
+    if explicit:
+        exp_path = Path(explicit).expanduser()
+        if exp_path.is_file():
+            return exp_path
+
     exe_name = default_exe_name()
     candidates = [
         config.PROJECT_ROOT / "tui" / "target" / "release" / exe_name,
@@ -81,11 +99,11 @@ def _verify_sha256(data: bytes, asset_name: str, sums_text: str) -> None:
     expected: str | None = None
     for line in sums_text.splitlines():
         parts = line.strip().split()
-        if len(parts) >= 2 and Path(parts[-1]).name == asset_name:
+        if len(parts) >= 2 and Path(parts[-1].lstrip("*")).name == asset_name:
             expected = parts[0].lower()
             break
     if expected is None:
-        return
+        raise RuntimeError(f"Checksum entry for {asset_name} missing from SHA256SUMS.txt")
     actual = hashlib.sha256(data).hexdigest().lower()
     if actual != expected:
         raise RuntimeError(
@@ -119,12 +137,12 @@ def download_tui_binary(
     repo: str | None = None,
     timeout: float = 60.0,
 ) -> Path:
-    """Download prebuilt `kgsh-tui` binary from GitHub Releases into `~/.kaggle_mcp/bin/`."""
+    """Download prebuilt `kgsh-tui` binary from GitHub Releases into `~/.kaggle_mcp/bin/` (Fail-Closed SHA256)."""
     pair = detect_platform_asset()
     if pair is None:
         raise RuntimeError(
             f"Unsupported platform {platform.system()}/{platform.machine()} for prebuilt kgsh-tui. "
-            "Build from source with: cargo build --release --manifest-path tui/Cargo.toml"
+            f"{_fallback_hint()}"
         )
     asset_name, exe_name = pair
     gh_repo = (repo or os.environ.get("KGSH_RELEASE_REPO") or DEFAULT_RELEASE_REPO).strip()
@@ -133,6 +151,7 @@ def download_tui_binary(
         f"https://github.com/{gh_repo}/releases/latest/download",
     ]
 
+    config.ensure_secure_state_dir(config.STATE_DIR)
     dest = cached_binary_path(version=version, exe_name=exe_name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = dest.with_name(f".{exe_name}.{os.getpid()}.tmp")
@@ -154,16 +173,20 @@ def download_tui_binary(
         if archive_bytes is None or used_base is None:
             raise RuntimeError(f"Could not download prebuilt kgsh-tui: {last_err}")
 
-        sums_resp = client.get(f"{used_base}/SHA256SUMS.txt")
-        if sums_resp.status_code == 200 and sums_resp.text:
-            _verify_sha256(archive_bytes, asset_name, sums_resp.text)
+        sums_url = f"{used_base}/SHA256SUMS.txt"
+        sums_resp = client.get(sums_url)
+        if sums_resp.status_code != 200 or not sums_resp.text.strip():
+            raise RuntimeError(
+                f"Refused unverified TUI binary: SHA256SUMS.txt unavailable (HTTP {sums_resp.status_code} at {sums_url})"
+            )
+        _verify_sha256(archive_bytes, asset_name, sums_resp.text)
 
     binary = _extract_binary_from_archive(archive_bytes, asset_name, exe_name)
     try:
         tmp_path.write_bytes(binary)
         if os.name != "nt":
             mode = tmp_path.stat().st_mode
-            tmp_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            tmp_path.chmod((mode & 0o700) | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         os.replace(tmp_path, dest)
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -181,15 +204,11 @@ def ensure_tui_binary(auto_download: bool = True, version: str = __version__) ->
 
     disable_flag = (os.environ.get("KGSH_NO_AUTO_DOWNLOAD") or "").strip().lower()
     if not auto_download or disable_flag in {"1", "true", "yes"}:
-        raise RuntimeError(
-            "kgsh-tui binary not found. Build from source with: "
-            "cargo build --release --manifest-path tui/Cargo.toml"
-        )
+        raise RuntimeError(f"kgsh-tui binary not found. {_fallback_hint()}")
 
     try:
         return download_tui_binary(version=version)
     except Exception as exc:
         raise RuntimeError(
-            f"kgsh-tui binary not found and auto-download failed: {exc}\n"
-            "You can build locally instead: cargo build --release --manifest-path tui/Cargo.toml"
+            f"kgsh-tui binary not found and auto-download failed: {exc}\n{_fallback_hint()}"
         ) from exc

@@ -68,27 +68,27 @@ flowchart TB
 ### 3.1. Zero-Contention Multi-Slot Isolation (`config.py`, `launcher.py`)
 Running two GPU sessions simultaneously on one Kaggle account fails if both sessions share a single kernel slug or state dataset. `kaggle-shell-mcp` isolates every resource by a normalized `slot` identifier (`"1"`, `"2"`, `"comp-1"`, etc.):
 
-- **Backward-Compatible Naming**:
+- **Backward-Compatible & Run-Scoped Naming**:
   - `slot="1"` (default) maps to `<user>/kaggle-mcp-worker` and `<user>/kaggle-mcp-state`.
   - Any additional `slot="<id>"` maps to `<user>/kaggle-mcp-worker-<id>` and `<user>/kaggle-mcp-state-<id>`.
-  - Batch runs map to `<user>/kaggle-mcp-worker-batch[-<id>]`.
-- **Parallel Provisioning (`slot="1,2"`)**: `launch_workers_multi` uses a thread pool with per-slot staging directories (`.kaggle_mcp/build_bundle_<slot>`) so concurrent `kernels_push` calls never overwrite each other's rendered scripts or `kernel-metadata.json`.
-- **Cross-Process Atomic State Store**: Access to `.kaggle_mcp/sessions.json` is serialized by both an in-process `threading.RLock` and an OS-level byte-range/advisory lock (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX) plus atomic temp-file rename (`os.replace`).
+  - Offline batch runs allocate an isolated **Run-Scoped Slug** (`<user>/kgsh-batch-<slot>-<run6>`) so cancelling a queued/faulty run via `kernels_delete` never touches outputs from earlier runs.
+- **Provisioning Persistence & 3-Tier Verified Shutdown**: `launch_worker` persists `ActiveSession(status="provisioning")` immediately after `kernels_push` (cleaning up temporary `build_bundle_*` files in `finally:`) and resumes waiting if re-invoked while the kernel is `QUEUED`/`RUNNING`. `shutdown_slot` verifies stop status across three tiers (in-band `/shutdown` -> out-of-band status check -> optional ephemeral `kernels_delete`) and refuses to wipe `sessions.json` if a GPU VM remains active.
+- **Cross-Process Atomic State Store**: Access to `.kaggle_mcp/sessions.json` (`0700` dir / `0600` files on POSIX) is serialized by both an in-process `threading.RLock` and an OS-level byte-range/advisory lock (`msvcrt.locking` on Windows, `fcntl.flock` on POSIX) plus atomic temp-file rename (`os.replace`).
 
 ### 3.2. Zero-Setup Tunnel & Auto-Healing Handshake (`worker_template.py`, `client.py`)
 1. On `kaggle_up`, the local launcher generates a fresh 12-byte `session_id` and a 32-byte (256-bit) `worker_token`, base64-encodes the bootstrap configuration into `worker_template.py`, and pushes the private script kernel.
-2. Inside Kaggle, `cloudflared_supervisor` downloads the static `cloudflared-linux-amd64` binary into `/tmp`, opens a tunnel to `http://127.0.0.1:8765`, parses the generated `https://*.trycloudflare.com` URL, and publishes `state.json` to the slot's **private** Kaggle Dataset (`<user>/kaggle-mcp-state[-<slot>]`).
-3. If `cloudflared` drops mid-session during a 12-hour run, the supervisor respawns it within 3 seconds and publishes the new URL. On the local side, `WorkerClient` detects `ConnectError` / `502` / `530`, refreshes `state.json` from the private Dataset, verifies `/ping` matches `session_id`, updates `sessions.json`, and transparently retries the RPC.
+2. Inside Kaggle, `cloudflared_supervisor` atomically downloads `cloudflared-linux-amd64` into `/tmp/kaggle_mcp_runtime`, opens a tunnel to `http://127.0.0.1:8765` (automatically switching from QUIC to `--protocol http2` after 2 quick QUIC failures), parses the `https://*.trycloudflare.com` URL, and publishes `state.json` to `<user>/kaggle-mcp-state[-<slot>]`.
+3. Mutating `POST` requests carry an `X-Idempotency-Key` header backed by an in-worker `IdempotencyRegistry` and never blindly re-POST on read timeouts—preventing duplicate training processes on transient network stalls.
 
-### 3.3. Stateful PTY Execution & Echo-Immune Sentinel Framing (`worker_template.py`)
-Agent tool calls need persistent shell state (`cd`, `export`, activated virtual environments) without hanging indefinitely or misreading echoed input:
-- `PtySession` allocates a Linux pseudo-terminal (`pty.openpty()`) configured to `40×160` (`TIOCSWINSZ`) with `stty -echo` and `TERM=dumb`.
+### 3.3. Stateful PTY Isolation & Echo-Immune Sentinel Framing (`worker_template.py`)
+Agent tool calls and human TUI commands execute in isolated persistent `/bin/bash` PTY sessions (`"default"` for MCP/CLI, `"tui"` for `kgsh ui`), preventing `cwd` collisions or cross-session `SIGINT` interrupts:
+- `PtySession` allocates a Linux pseudo-terminal (`pty.openpty()`) configured to `40×160` (`TIOCSWINSZ`) with `stty -echo`, `TERM=dumb`, bounded head/tail output buffers, and child-environment secret scrubbing (`_scrubbed_child_env`).
 - Every command appends a split-quote `printf` sentinel:
   ```bash
   __mcp_ec=$?; printf '\n__MCP_END_%s__:%d:%s\n' '<half1>''<half2>' "$__mcp_ec" "$PWD"
   ```
   Because the input contains single quotes splitting the UUID in half while `printf` emits the concatenated UUID, terminal echo (even if re-enabled by a child binary) can never prematurely trigger sentinel detection.
-- If a foreground command exceeds `timeout_sec`, `PtySession` sends `SIGINT` (`\x03`), drains remaining bytes, and returns partial output with `timed_out=True` so the shell remains usable for subsequent calls.
+- `PtyManager.interrupt(session)` scopes `SIGINT` (`\x03`) strictly to the named session, and `/monitor` exposes `pty_sessions_live` per session.
 
 ### 3.4. Detached GPU Jobs & Context-Window Protection (`worker_template.py`)
 Long training runs should never be tied to an HTTP request lifetime:
@@ -102,14 +102,14 @@ When targeting restricted competition accelerators (`NvidiaL4x4`, `NvidiaRtxPro6
 2. **Atomic Code Delivery (`kaggle_batch_run`)**:
    - Source bundles `<= 512 KB` compressed are embedded directly inside `offline_runner.py` as base64—eliminating dataset creation latency and indexing races completely.
    - Larger bundles (`> 512 KB`) are uploaded to a private Dataset with a `.kgsh` extension (preventing Kaggle's GCS ingestion pipeline from auto-extracting `.tar.gz` archives) and verified via `dataset_list_files` before pushing the kernel.
-   - At runtime, `offline_runner.py` extracts code into `/tmp/kgsh_batch_work` so `/kaggle/working`'s 20 GB output quota remains untouched for checkpoints and `submission.csv`.
-3. **Bounded Host SSE Log Reader (`collect_stream_window`)**:
+   - At runtime, `offline_runner.py` extracts code into `/tmp/kgsh_batch_work`, records a baseline snapshot, and automatically harvests any newly created or modified outputs (`submission.csv`, `checkpoints/`) into `/kaggle/working` (`os.sync()`) inside a `finally:` block before exiting.
+3. **Bounded Host SSE Log Reader (`collect_stream_window`, `merge_sse_log_snapshot`)**:
    - Kaggle's host-level `GET /api/v1/kernels/logs/stream/{owner}/{slug}` streams container stdout over Server-Sent Events (`text/event-stream`) even when container networking is disabled, but blocks until kernel completion.
-   - `collect_stream_window` runs the SSE generator on a daemon thread feeding a `queue.Queue` with a bounded window (`wait_sec`) and early idle break (`idle_break_sec`), then closes the generator (`response.close()`) and caches cumulative output locally—providing instant, non-blocking live logs to MCP clients.
+   - `collect_stream_window` runs the SSE generator on a daemon thread feeding a `queue.Queue` with a bounded window (`wait_sec`) and early idle break (`idle_break_sec`), closes the underlying HTTP socket cleanly, and stitches cumulative/overlapping chunks via `merge_sse_log_snapshot` without $O(N^2)$ duplication.
 
 ### 3.6. Stdout Purity & Security Boundaries
-- **MCP `stdio` Integrity**: Third-party SDKs (`kaggle` / `kagglesdk`) occasionally print warnings or URLs to `sys.stdout`, which would corrupt MCP JSON-RPC frames. Every SDK import and API call in `launcher.py` and `batch.py` executes inside `contextlib.redirect_stdout(sys.stderr)`.
-- **Constant-Time Auth & Safe Extraction**: All worker endpoints (except minimal `/ping` session-ID probes) verify `Authorization: Bearer <worker_token>` via `hmac.compare_digest`. Both local and remote tar extractors enforce resolved path-prefix checks and skip symlinks/hardlinks (`filter="data"`).
+- **MCP `stdio` Integrity**: Third-party SDKs (`kaggle>=2.2.0` / `kagglesdk`) occasionally print warnings or URLs to `sys.stdout`, which would corrupt MCP JSON-RPC frames. Every SDK import and API call in `launcher.py` and `batch.py` executes inside `contextlib.redirect_stdout(sys.stderr)`.
+- **Constant-Time Auth, Sandbox & Archive Safety**: All worker endpoints (except minimal `/ping` session-ID probes) verify `Authorization: Bearer <worker_token>` via `hmac.compare_digest`. File endpoints enforce `_assert_writable_path` (protecting `/kaggle/input` and `/tmp/kaggle_mcp_runtime`), archive packers exclude `.env*`/`kaggle.json`/private keys by default, extractors enforce `Path.is_relative_to`, symlink-parent checks, and a `2 GiB` extraction ceiling, and `tui_bin.py` enforces **Fail-Closed** `SHA256SUMS.txt` verification.
 
 ---
 
@@ -149,5 +149,12 @@ kaggle-shell-mcp/
 │       ├── bridge.rs                  # Async tokio stdin/stdout caller for kaggle_mcp.bridge
 │       ├── state.rs                   # Shared sessions.json / profiles.json / activity bus readers
 │       └── file_icons.rs              # Graphite palette constants, single-width badges & line highlighting
-└── tests/                             # Offline pytest suite (accelerators, bridge, multi-slot locking, SSE, sync, stdio)
+└── tests/                             # Restructured offline pytest suite
+    ├── conftest.py                    # Shared state_dir fixtures & AST runtime template loaders
+    ├── test_config_and_profiles.py    # Auth, slots, locking, profiles, accelerators & quota
+    ├── test_launcher_and_lifecycle.py # Bootstrap bundle, provisioning resume & 3-tier shutdown
+    ├── test_client_and_sync.py        # Idempotency, 404 fallbacks, secret-safe tar & Fail-Closed TUI bin
+    ├── test_batch_engine.py           # Offline runner auto-harvest, Host SSE & log overlap stitching
+    ├── test_remote_worker.py          # Worker sandbox, smart inspect, env scrubbing & PTY isolation
+    └── test_hub_bridge_and_mcp.py     # Kaggle Hub, activity spans, Rust JSON bridge & MCP stdio server
 ```

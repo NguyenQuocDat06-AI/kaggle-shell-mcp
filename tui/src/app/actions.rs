@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use crate::bridge::RefreshEndpointRes;
 use super::*;
 
+const EDITOR_MAX_BYTES: usize = 262_144; // 256 KB safe editor cap
+
 impl App {
     pub fn interrupt_running_exec(&mut self) {
         let Some(sess) = self.active_session() else {
@@ -15,7 +17,7 @@ impl App {
         let tx = self.tx.clone();
         self.notify("Sending Ctrl+C interrupt...", false);
         tokio::spawn(async move {
-            match http.term_interrupt(&sess, "default").await {
+            match http.term_interrupt(&sess, "tui").await {
                 Ok(_) => {
                     let _ = tx.send(AppMsg::Toast {
                         text: "Sent Ctrl+C to running command".into(),
@@ -89,11 +91,21 @@ impl App {
         self.sessions = load_all_sessions(&self.state_dir);
         let slot = self.current_slot.clone();
         let Some(sess) = self.sessions.get(&slot).cloned() else {
+            self.poll_in_flight.remove(&slot);
             self.is_online = false;
             self.rtt_ms = None;
             self.status_line = format!("Slot {} Standby — F5 Boot / Ctrl+W Workers", slot);
             return;
         };
+
+        if let Some(until) = self.poll_backoff_until {
+            if Instant::now() < until {
+                return;
+            }
+        }
+        if !self.poll_in_flight.insert(slot.clone()) {
+            return;
+        }
 
         if sess.mode == "batch" {
             let bridge = self.bridge.clone();
@@ -114,12 +126,6 @@ impl App {
                 }
             });
             return;
-        }
-
-        if let Some(until) = self.poll_backoff_until {
-            if Instant::now() < until {
-                return;
-            }
         }
 
         let http = self.http.clone();
@@ -209,8 +215,16 @@ impl App {
                     Err(e) => { let _ = tx.send(AppMsg::Toast { text: format!("Inspect failed: {}", e), is_err: true }); }
                 }
             } else {
-                match http.fs_read_text(&sess, &path, 65536).await {
-                    Ok(res) => { let _ = tx.send(AppMsg::FsReadDone(res.path, res.content)); }
+                match http.fs_read_text(&sess, &path, EDITOR_MAX_BYTES).await {
+                    Ok(res) => {
+                        let _ = tx.send(AppMsg::FsReadDone {
+                            path: res.path,
+                            content: res.content,
+                            truncated: res.truncated,
+                            is_binary: res.is_binary,
+                            size_bytes: res.size_bytes,
+                        });
+                    }
                     Err(e) => { let _ = tx.send(AppMsg::Toast { text: format!("Open failed: {}", e), is_err: true }); }
                 }
             }
@@ -219,14 +233,33 @@ impl App {
     }
 
     pub fn open_local_file_editor(&mut self, path: PathBuf) {
-        let raw = match std::fs::read(&path) {
-            Ok(b) => b,
+        use std::io::Read;
+        let meta_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
             Err(e) => {
                 self.notify(format!("Read local file failed: {}", e), true);
                 return;
             }
         };
-        let slice = &raw[..raw.len().min(65536)];
+        let mut raw = Vec::with_capacity(EDITOR_MAX_BYTES.min(meta_len as usize) + 1);
+        if let Err(e) = file.take((EDITOR_MAX_BYTES + 1) as u64).read_to_end(&mut raw) {
+            self.notify(format!("Read local file failed: {}", e), true);
+            return;
+        }
+        let truncated = raw.len() > EDITOR_MAX_BYTES || meta_len > EDITOR_MAX_BYTES as u64;
+        let slice = &raw[..raw.len().min(EDITOR_MAX_BYTES)];
+        let is_binary = slice[..slice.len().min(8192)].contains(&0);
+        let (readonly, readonly_reason) = if is_binary {
+            (true, format!("Read-Only (binary · {})", fmt_bytes(meta_len)))
+        } else if truncated {
+            (
+                true,
+                format!("Read-Only (truncated > 256 KB of {})", fmt_bytes(meta_len)),
+            )
+        } else {
+            (false, String::new())
+        };
         let txt = String::from_utf8_lossy(slice);
         let lines: Vec<String> = if txt.is_empty() {
             vec![String::new()]
@@ -238,16 +271,14 @@ impl App {
             is_new: false,
             path: TextField::new(path.to_string_lossy().to_string()),
             lines,
-            cur_row: 0,
-            cur_col: 0,
-            sel_anchor: None,
-            scroll_row: 0,
-            readonly: raw.len() > 65536,
-            focus_path: false,
+            readonly,
+            readonly_reason,
+            ..Default::default()
         }));
     }
 
     pub fn load_local_preview_into_drawer(&mut self, ent: &LocalEntry) {
+        use std::io::Read;
         let pstr = ent.path.to_string_lossy().to_string();
         if ent.is_dir {
             let count = std::fs::read_dir(&ent.path).map(|rd| rd.count()).unwrap_or(0);
@@ -263,9 +294,17 @@ impl App {
             });
             return;
         }
-        let raw = std::fs::read(&ent.path).unwrap_or_default();
-        let preview = String::from_utf8_lossy(&raw[..raw.len().min(16384)]);
-        let lines: Vec<String> = preview.lines().take(160).map(|s| s.to_string()).collect();
+        let mut raw = Vec::with_capacity(16384);
+        if let Ok(f) = std::fs::File::open(&ent.path) {
+            let _ = f.take(16384).read_to_end(&mut raw);
+        }
+        let is_bin = raw[..raw.len().min(4096)].contains(&0);
+        let lines: Vec<String> = if is_bin {
+            vec![format!("(binary file · {})", fmt_bytes(ent.size_bytes))]
+        } else {
+            let preview = String::from_utf8_lossy(&raw);
+            preview.lines().take(160).map(|s| s.to_string()).collect()
+        };
         self.preview_drawer = Some(PreviewDrawerState {
             target_path: pstr,
             title: ent.name.clone(),
@@ -903,11 +942,20 @@ impl App {
                     let mode = sess.mode.clone();
                     let acc = sess.accelerator.clone();
                     if mode != "live" || sess.base_url().is_empty() {
+                        let st_lbl = if mode == "batch" {
+                            "BATCH".into()
+                        } else if sess.status == "provisioning" {
+                            "BOOTING".into()
+                        } else if sess.status == "unreachable" {
+                            "UNREACHABLE".into()
+                        } else {
+                            "OFFLINE".into()
+                        };
                         return ClusterRow {
                             slot,
                             mode: mode.clone(),
                             accelerator: acc,
-                            state: if mode == "batch" { "BATCH".into() } else { "OFFLINE".into() },
+                            state: st_lbl,
                             compute: "--".into(),
                             ram: "--".into(),
                             jobs: "--".into(),
@@ -918,8 +966,11 @@ impl App {
                     match h.monitor(&sess, 0, "", 0).await {
                         Ok((p, rtt)) => {
                             let st = &p.status;
-                            let compute = if let Some(g0) = st.gpus.first() {
-                                format!("{:.0}% · {:.0}/{:.0}MB", g0.util_pct, g0.vram_used_mb, g0.vram_total_mb)
+                            let compute = if !st.gpus.is_empty() {
+                                let max_u = st.gpus.iter().map(|g| g.util_pct).fold(0.0, f64::max);
+                                let used_g: f64 = st.gpus.iter().map(|g| g.vram_used_mb).sum::<f64>() / 1024.0;
+                                let tot_g: f64 = st.gpus.iter().map(|g| g.vram_total_mb).sum::<f64>() / 1024.0;
+                                format!("{}xGPU {:.0}% · {:.1}/{:.0}G", st.gpus.len(), max_u, used_g, tot_g)
                             } else {
                                 format!("CPU {:.0}%", st.cpu_pct)
                             };
@@ -1131,7 +1182,7 @@ impl App {
         let http = self.http.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match http.term_exec(&sess, &cmd, "default", 120.0).await {
+            match http.term_exec(&sess, &cmd, "tui", 85.0).await {
                 Ok(res) => { let _ = tx.send(AppMsg::ExecDone { slot, cmd, res }); }
                 Err(e) => { let _ = tx.send(AppMsg::ExecErr { slot, cmd, err: e.to_string() }); }
             }
@@ -1326,7 +1377,7 @@ impl App {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
-                copy_clipboard(&txt);
+                self.set_clipboard_text(&txt);
                 self.notify(format!("Copied {} log chars", txt.len()), false);
             }
             _ => {}
@@ -1772,7 +1823,7 @@ impl App {
                         .unwrap_or_else(|| lp.dir.to_string_lossy().to_string()),
                     _ => "/kaggle/working".into(),
                 };
-                copy_clipboard(&p);
+                self.set_clipboard_text(&p);
                 self.notify(format!("Copied {}", p), false);
             }
             "delete" => self.trigger_delete_selected(),
@@ -1805,7 +1856,7 @@ impl App {
             "filter_logs" => self.input_focus = InputFocus::LogFilter,
             "copy_logs" => {
                 let txt = self.filtered_log_lines().into_iter().cloned().collect::<Vec<_>>().join("\n");
-                copy_clipboard(&txt);
+                self.set_clipboard_text(&txt);
                 self.notify(format!("Copied {} log chars", txt.len()), false);
             }
             "hub_search" => self.input_focus = InputFocus::HubSearch,
